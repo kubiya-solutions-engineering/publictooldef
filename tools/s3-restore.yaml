@@ -7,7 +7,7 @@ tools:
       # Set default values for environment variables
       REPO_URL="${REPO_URL:-https://github.com/verana-health/kubi-tools}"
       REPO_NAME="${REPO_NAME:-kubi-tools}"
-      SOURCE_CODE_DIR="${SOURCE_CODE_DIR:-/src}"
+      SOURCE_CODE_DIR="${SOURCE_CODE_DIR:-src}"
       REPO_BRANCH="${REPO_BRANCH:-main}"
       REPO_DIR="${REPO_DIR:-$REPO_NAME}"
       BIN_DIR="${BIN_DIR:-/usr/local/bin}"
