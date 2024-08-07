@@ -9,7 +9,7 @@ EOT
 llm_model          = "azure/gpt-4o"
 agent_image        = "kubiya/base-agent:tools-v5"
 
-secrets            = []
+secrets            = ["TOOLS_GH_TOKEN"]
 integrations       = ["Sandbox", "slack"]
 users              = []
 groups             = ["Admin"]
