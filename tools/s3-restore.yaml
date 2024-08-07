@@ -60,7 +60,6 @@ tools:
       - KUBIYA_AGENT_UUID
       - KUBIYA_USER_ORG
       - KUBIYA_API_KEY
-      - TOOLS_GH_TOKEN
     with_volumes:
       - name: sqlite_data
         path: /sqlite_data
