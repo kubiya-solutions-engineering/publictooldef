@@ -5,8 +5,8 @@ tools:
     alias: s3restore
     content: |
       # Set default values for environment variables
-      REPO_URL="${REPO_URL:-https://github.com/verana-health/kubi-tools}"
-      REPO_NAME="${REPO_NAME:-kubi-tools}"
+      REPO_URL="${REPO_URL:-https://github.com/kubiya-solutions-engineering/publictooldef}"
+      REPO_NAME="${REPO_NAME:-publictooldef}"
       SOURCE_CODE_DIR="${SOURCE_CODE_DIR:-src}"
       REPO_BRANCH="${REPO_BRANCH:-main}"
       REPO_DIR="${REPO_DIR:-$REPO_NAME}"
