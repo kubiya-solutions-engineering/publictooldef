@@ -41,11 +41,8 @@ tools:
 
       # Make the Go script executable and run it
       export PATH="${PATH}:/${REPO_DIR}/${SOURCE_CODE_DIR}"
-      exec ./s3-restore --ttl "{{ .days }}" --bucket_paths "{{ .bucket_paths }}" --region "{{ .region }}"
+      exec ./s3-restore --bucket_paths "{{ .bucket_paths }}" --region "{{ .region }}"
     args:
-      - name: days
-        description: The number of days to keep the restored objects (optional, default is 180)
-        required: false
       - name: bucket_paths
         description: The list of S3 bucket paths to restore, as a comma-separated string
         required: true
