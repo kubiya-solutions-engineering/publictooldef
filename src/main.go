@@ -22,7 +22,6 @@ import (
 type RestoreRequest struct {
 	RequestID      string   `json:"request_id"`
 	BucketPaths    []string `json:"bucket_paths"`
-	TTL            int      `json:"ttl"`
 	ProcessedPaths []string `json:"processed_paths"`
 	CreatedAt      string   `json:"created_at"`
 	UpdatedAt      string   `json:"updated_at"`
@@ -72,7 +71,7 @@ func sendSlackNotification(channel, threadTS string, blocks []slack.Block) error
 	return nil
 }
 
-func createDBAndRecord(requestID string, bucketPaths []string, ttl int) error {
+func createDBAndRecord(requestID string, bucketPaths []string) error {
 	db, err := sql.Open("sqlite3", "./s3_restore_requests.db")
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
@@ -83,7 +82,6 @@ func createDBAndRecord(requestID string, bucketPaths []string, ttl int) error {
 	CREATE TABLE IF NOT EXISTS restore_requests (
 		request_id TEXT PRIMARY KEY,
 		bucket_paths TEXT,
-		ttl INTEGER,
 		processed_paths TEXT,
 		created_at TEXT,
 		updated_at TEXT
@@ -96,9 +94,9 @@ func createDBAndRecord(requestID string, bucketPaths []string, ttl int) error {
 	bucketPathsJSON, _ := json.Marshal(bucketPaths)
 	processedPathsJSON, _ := json.Marshal([]string{})
 	insertQuery := `
-	INSERT INTO restore_requests (request_id, bucket_paths, ttl, processed_paths, created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?)`
-	_, err = db.Exec(insertQuery, requestID, bucketPathsJSON, ttl, processedPathsJSON, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
+	INSERT INTO restore_requests (request_id, bucket_paths, processed_paths, created_at, updated_at)
+	VALUES (?, ?, ?, ?, ?)`
+	_, err = db.Exec(insertQuery, requestID, bucketPathsJSON, processedPathsJSON, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
 		return fmt.Errorf("failed to insert record: %w", err)
 	}
@@ -111,8 +109,8 @@ func createDBAndRecord(requestID string, bucketPaths []string, ttl int) error {
 		slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
-				Text: fmt.Sprintf("*Request ID:* `%s`\n*TTL:* `%d` days\n*Created At:* `%s`\n*Updated At:* `%s`\n",
-					requestID, ttl, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339)),
+				Text: fmt.Sprintf("*Request ID:* `%s`\n*Created At:* `%s`\n*Updated At:* `%s`\n",
+					requestID, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339)),
 			},
 			nil,
 			nil,
@@ -353,7 +351,6 @@ func restoreObjectsInPath(bucketPath, region, requestID string, failedPaths *[]s
 func main() {
 	bucketPaths := flag.String("bucket_paths", "", "Comma-separated list of S3 bucket paths to restore")
 	region := flag.String("region", "", "AWS region")
-	ttl := flag.Int("ttl", 30, "Time-to-live (TTL) in days for restored objects before reverting to original storage class")
 	flag.Parse()
 
 	if *bucketPaths == "" {
@@ -367,7 +364,7 @@ func main() {
 	bucketPathsList := strings.Split(*bucketPaths, ",")
 	var failedPaths []string
 
-	err := createDBAndRecord(requestID, bucketPathsList, *ttl)
+	err := createDBAndRecord(requestID, bucketPathsList)
 	if err != nil {
 		log.Fatalf("Failed to create DB record: %v\n", err)
 	}
