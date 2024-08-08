@@ -477,7 +477,6 @@ func main() {
 	}
 
 	// Prepare the final summary message
-	processedPathsJSON, _ := json.Marshal(bucketPathsList)
 	blocks := []slack.Block{
 		slack.NewHeaderBlock(&slack.TextBlockObject{
 			Type: slack.PlainTextType,
@@ -486,22 +485,15 @@ func main() {
 		slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
-				Text: fmt.Sprintf("*Request ID:* `%s`\n*Processed Paths:* `%s`\n*Failed Paths:* `%s`",
-					requestID, processedPathsJSON, failedPaths),
+				Text: fmt.Sprintf("*Request ID:* `%s`\n*Processed Paths:*", requestID),
 			},
 			nil,
 			nil,
 		),
 		slack.NewDividerBlock(),
-		slack.NewSectionBlock(
-			&slack.TextBlockObject{
-				Type: slack.MarkdownType,
-				Text: "*Bucket Paths Processed:*",
-			},
-			nil,
-			nil,
-		),
 	}
+
+	// Add processed paths
 	for _, path := range bucketPathsList {
 		blocks = append(blocks, slack.NewSectionBlock(
 			&slack.TextBlockObject{
@@ -511,6 +503,28 @@ func main() {
 			nil,
 			nil,
 		))
+	}
+
+	// Add failed paths if any
+	if len(failedPaths) > 0 {
+		blocks = append(blocks, slack.NewDividerBlock(), slack.NewSectionBlock(
+			&slack.TextBlockObject{
+				Type: slack.MarkdownType,
+				Text: "*Failed Paths:*",
+			},
+			nil,
+			nil,
+		))
+		for _, path := range failedPaths {
+			blocks = append(blocks, slack.NewSectionBlock(
+				&slack.TextBlockObject{
+					Type: slack.MarkdownType,
+					Text: fmt.Sprintf("- `%s`", path),
+				},
+				nil,
+				nil,
+			))
+		}
 	}
 
 	if err := sendSlackNotification(os.Getenv("SLACK_CHANNEL_ID"), os.Getenv("SLACK_THREAD_TS"), blocks); err != nil {
