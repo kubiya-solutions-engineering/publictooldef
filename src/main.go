@@ -95,7 +95,7 @@ func createDBAndRecord(requestID string, bucketPaths []string) error {
 	processedPathsJSON, _ := json.Marshal([]string{})
 	insertQuery := `
 	INSERT INTO restore_requests (request_id, bucket_paths, processed_paths, created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?)`
+	VALUES (?, ?, ?, ?, ?, ?)`
 	_, err = db.Exec(insertQuery, requestID, bucketPathsJSON, processedPathsJSON, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
 		return fmt.Errorf("failed to insert record: %w", err)
@@ -278,17 +278,19 @@ func restoreObject(svc *s3.S3, bucketName, key string) error {
 	}
 
 	// Wait for a few seconds to ensure the object storage class is updated
-	time.Sleep(5 * time.Second)
+	time.Sleep(10 * time.Second)
 
 	// Check if the object storage class was updated successfully
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 5; i++ {
 		headInput := &s3.HeadObjectInput{
 			Bucket: aws.String(bucketName),
 			Key:    aws.String(key),
 		}
 		headOutput, err := svc.HeadObject(headInput)
 		if err != nil {
-			return fmt.Errorf("failed to verify storage class for object %s: %v", key, err)
+			log.Printf("Attempt %d: failed to verify storage class for object %s: %v", i+1, key, err)
+		} else {
+			log.Printf("Attempt %d: Storage class for object %s is %v", i+1, key, headOutput.StorageClass)
 		}
 
 		if headOutput.StorageClass != nil && *headOutput.StorageClass == "STANDARD" {
@@ -297,7 +299,7 @@ func restoreObject(svc *s3.S3, bucketName, key string) error {
 		}
 
 		// Wait for a few seconds before retrying
-		time.Sleep(2 * time.Second)
+		time.Sleep(5 * time.Second)
 	}
 
 	return fmt.Errorf("storage class for object %s is not STANDARD, it is <nil>", key)
