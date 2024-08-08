@@ -95,7 +95,7 @@ func createDBAndRecord(requestID string, bucketPaths []string) error {
 	processedPathsJSON, _ := json.Marshal([]string{})
 	insertQuery := `
 	INSERT INTO restore_requests (request_id, bucket_paths, processed_paths, created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?)`
+	VALUES (?, ?, ?, ?, ?)`
 	_, err = db.Exec(insertQuery, requestID, bucketPathsJSON, processedPathsJSON, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
 		return fmt.Errorf("failed to insert record: %w", err)
