@@ -41,16 +41,14 @@ tools:
 
       # Make the Go script executable and run it
       export PATH="${PATH}:/${REPO_DIR}/${SOURCE_CODE_DIR}"
-      exec ./s3-restore --bucket_paths "{{ .bucket_paths }}" --region "{{ .region }}"
+      exec ./s3-restore --bucket_paths "{{ .bucket_paths }}"
     args:
       - name: bucket_paths
         description: The list of S3 bucket paths to restore, as a comma-separated string
         required: true
-      - name: region
-        description: The AWS region
-        required: true
     env:
       - AWS_PROFILE
+      - AWS_DEFAULT_REGION
       - SLACK_API_TOKEN
       - SLACK_CHANNEL_ID
       - SLACK_THREAD_TS

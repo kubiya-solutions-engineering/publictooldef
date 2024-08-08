@@ -447,15 +447,16 @@ func verifyStorageClasses(bucketPath, region string, failedPaths *[]string, maxC
 
 func main() {
 	bucketPaths := flag.String("bucket_paths", "", "Comma-separated list of S3 bucket paths to restore")
-	region := flag.String("region", "", "AWS region")
 	maxConcurrentOps := flag.Int64("max_concurrent_ops", 50, "Maximum number of concurrent operations")
 	flag.Parse()
 
+	region := os.Getenv("AWS_DEFAULT_REGION")
+	if region == "" {
+		log.Fatal("AWS_DEFAULT_REGION environment variable is not set")
+	}
+
 	if *bucketPaths == "" {
 		log.Fatal("Please provide bucket paths")
-	}
-	if *region == "" {
-		log.Fatal("Please provide an AWS region")
 	}
 
 	requestID := generateRequestID()
@@ -468,12 +469,12 @@ func main() {
 	}
 
 	for _, path := range bucketPathsList {
-		restoreObjectsInPath(path, *region, requestID, &failedPaths, *maxConcurrentOps)
+		restoreObjectsInPath(path, region, requestID, &failedPaths, *maxConcurrentOps)
 	}
 
 	// Verify the storage classes after all restores have been initiated
 	for _, path := range bucketPathsList {
-		verifyStorageClasses(path, *region, &failedPaths, *maxConcurrentOps)
+		verifyStorageClasses(path, region, &failedPaths, *maxConcurrentOps)
 	}
 
 	// Prepare the final summary message
