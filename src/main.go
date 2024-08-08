@@ -486,7 +486,7 @@ func main() {
 		slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
-				Text: fmt.Sprintf("*Request ID:* `%s`\n*Processed Paths:*", requestID),
+				Text: fmt.Sprintf("The restore process for the specified S3 bucket paths has been successfully completed. All objects have been moved from Reduced Redundancy to Standard storage class. If you need any further assistance, feel free to ask!\n\n*Request ID:* `%s`\n*Processed Paths:*", requestID),
 			},
 			nil,
 			nil,
@@ -506,16 +506,25 @@ func main() {
 		))
 	}
 
-	// Add failed paths if any
-	if len(failedPaths) > 0 {
-		blocks = append(blocks, slack.NewDividerBlock(), slack.NewSectionBlock(
+	// Add failed paths section
+	blocks = append(blocks, slack.NewDividerBlock(), slack.NewSectionBlock(
+		&slack.TextBlockObject{
+			Type: slack.MarkdownType,
+			Text: "*Failed Paths:*",
+		},
+		nil,
+		nil,
+	))
+	if len(failedPaths) == 0 {
+		blocks = append(blocks, slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
-				Text: "*Failed Paths:*",
+				Text: "- None",
 			},
 			nil,
 			nil,
 		))
+	} else {
 		for _, path := range failedPaths {
 			blocks = append(blocks, slack.NewSectionBlock(
 				&slack.TextBlockObject{
@@ -532,5 +541,5 @@ func main() {
 		log.Printf("Error sending Slack notification: %v\n", err)
 	}
 
-	fmt.Printf(":white_check_mark: Restore process completed for Request ID: %s\n", requestID)
+	fmt.Printf(":white_check_mark: *Restore process completed for Request ID:* *%s*\n", requestID)
 }
