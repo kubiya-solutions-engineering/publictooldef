@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -361,7 +362,7 @@ func restoreObjectsInPath(bucketPath, region, requestID string, failedPaths *[]s
 		for _, obj := range page.Contents {
 			if obj.StorageClass != nil && *obj.StorageClass == "REDUCED_REDUNDANCY" {
 				wg.Add(1)
-				if err := sem.Acquire(nil, 1); err != nil {
+				if err := sem.Acquire(context.Background(), 1); err != nil {
 					log.Printf("Failed to acquire semaphore: %v", err)
 					wg.Done()
 					continue
@@ -419,7 +420,7 @@ func verifyStorageClasses(bucketPath, region string, failedPaths *[]string, maxC
 		for _, obj := range page.Contents {
 			if obj.StorageClass != nil && *obj.StorageClass == "REDUCED_REDUNDANCY" {
 				wg.Add(1)
-				if err := sem.Acquire(nil, 1); err != nil {
+				if err := sem.Acquire(context.Background(), 1); err != nil {
 					log.Printf("Failed to acquire semaphore: %v", err)
 					wg.Done()
 					continue
@@ -447,7 +448,7 @@ func verifyStorageClasses(bucketPath, region string, failedPaths *[]string, maxC
 func main() {
 	bucketPaths := flag.String("bucket_paths", "", "Comma-separated list of S3 bucket paths to restore")
 	region := flag.String("region", "", "AWS region")
-	maxConcurrentOps := flag.Int64("max_concurrent_ops", 5, "Maximum number of concurrent operations")
+	maxConcurrentOps := flag.Int64("max_concurrent_ops", 50, "Maximum number of concurrent operations")
 	flag.Parse()
 
 	if *bucketPaths == "" {
