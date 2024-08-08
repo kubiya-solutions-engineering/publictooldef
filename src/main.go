@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -17,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/slack-go/slack"
+	"golang.org/x/sync/semaphore"
 )
 
 type RestoreRequest struct {
@@ -262,7 +264,10 @@ func updateProcessedPaths(requestID, processedPath string) error {
 	return nil
 }
 
-func restoreObject(svc *s3.S3, bucketName, key string) error {
+func restoreObject(svc *s3.S3, bucketName, key string, sem *semaphore.Weighted, wg *sync.WaitGroup) {
+	defer wg.Done()
+	defer sem.Release(1)
+
 	log.Printf("Attempting to restore object: %s/%s", bucketName, key)
 
 	copyInput := &s3.CopyObjectInput{
@@ -274,13 +279,11 @@ func restoreObject(svc *s3.S3, bucketName, key string) error {
 
 	_, err := svc.CopyObject(copyInput)
 	if err != nil {
-		return fmt.Errorf("failed to restore object %s: %v", key, err)
+		log.Printf("Failed to restore object %s: %v", key, err)
 	}
+}
 
-	// Wait for a few seconds to ensure the object storage class is updated
-	time.Sleep(10 * time.Second)
-
-	// Check if the object storage class was updated successfully
+func verifyObjectStorageClass(svc *s3.S3, bucketName, key string, failedPaths *[]string, mutex *sync.Mutex) error {
 	for i := 0; i < 5; i++ {
 		headInput := &s3.HeadObjectInput{
 			Bucket: aws.String(bucketName),
@@ -320,10 +323,14 @@ func restoreObject(svc *s3.S3, bucketName, key string) error {
 		}
 	}
 
+	mutex.Lock()
+	*failedPaths = append(*failedPaths, key)
+	mutex.Unlock()
+
 	return fmt.Errorf("storage class for object %s is not STANDARD, it is <nil>", key)
 }
 
-func restoreObjectsInPath(bucketPath, region, requestID string, failedPaths *[]string) {
+func restoreObjectsInPath(bucketPath, region, requestID string, failedPaths *[]string, maxConcurrentOps int64) {
 	log.Printf("Starting to process bucket path: %s\n", bucketPath)
 	parts := strings.SplitN(bucketPath, "/", 2)
 	if len(parts) < 2 {
@@ -341,6 +348,8 @@ func restoreObjectsInPath(bucketPath, region, requestID string, failedPaths *[]s
 	}
 
 	svc := s3.New(sess)
+	sem := semaphore.NewWeighted(maxConcurrentOps)
+	var wg sync.WaitGroup
 
 	params := &s3.ListObjectsV2Input{
 		Bucket: aws.String(bucketName),
@@ -351,18 +360,19 @@ func restoreObjectsInPath(bucketPath, region, requestID string, failedPaths *[]s
 		log.Printf("Listing objects in bucket path: %s\n", bucketPath)
 		for _, obj := range page.Contents {
 			if obj.StorageClass != nil && *obj.StorageClass == "REDUCED_REDUNDANCY" {
-				err := restoreObject(svc, bucketName, *obj.Key)
-				if err != nil {
-					log.Printf("Error restoring object %s: %v\n", *obj.Key, err)
-					*failedPaths = append(*failedPaths, *obj.Key)
+				wg.Add(1)
+				if err := sem.Acquire(nil, 1); err != nil {
+					log.Printf("Failed to acquire semaphore: %v", err)
+					wg.Done()
 					continue
 				}
-				// Wait for a few seconds to ensure the object is processed before moving on to the next
-				time.Sleep(2 * time.Second)
+				go restoreObject(svc, bucketName, *obj.Key, sem, &wg)
 			}
 		}
 		return true
 	})
+
+	wg.Wait()
 
 	if err != nil {
 		log.Printf("Failed to list objects for bucket path %s: %v\n", bucketPath, err)
@@ -377,9 +387,67 @@ func restoreObjectsInPath(bucketPath, region, requestID string, failedPaths *[]s
 	}
 }
 
+func verifyStorageClasses(bucketPath, region string, failedPaths *[]string, maxConcurrentOps int64) {
+	log.Printf("Starting to verify storage classes for bucket path: %s\n", bucketPath)
+	parts := strings.SplitN(bucketPath, "/", 2)
+	if len(parts) < 2 {
+		log.Printf("Invalid bucket path: %s\n", bucketPath)
+		*failedPaths = append(*failedPaths, bucketPath)
+		return
+	}
+	bucketName, prefix := parts[0], parts[1]
+
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String(region)},
+	)
+	if err != nil {
+		log.Fatalf("Failed to create session: %v\n", err)
+	}
+
+	svc := s3.New(sess)
+	sem := semaphore.NewWeighted(maxConcurrentOps)
+	var mutex sync.Mutex
+	var wg sync.WaitGroup
+
+	params := &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucketName),
+		Prefix: aws.String(prefix),
+	}
+
+	err = svc.ListObjectsV2Pages(params, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
+		log.Printf("Listing objects for verification in bucket path: %s\n", bucketPath)
+		for _, obj := range page.Contents {
+			if obj.StorageClass != nil && *obj.StorageClass == "REDUCED_REDUNDANCY" {
+				wg.Add(1)
+				if err := sem.Acquire(nil, 1); err != nil {
+					log.Printf("Failed to acquire semaphore: %v", err)
+					wg.Done()
+					continue
+				}
+				go func(key string) {
+					defer wg.Done()
+					defer sem.Release(1)
+					if err := verifyObjectStorageClass(svc, bucketName, key, failedPaths, &mutex); err != nil {
+						log.Printf("Error verifying object %s: %v\n", key, err)
+					}
+				}(*obj.Key)
+			}
+		}
+		return true
+	})
+
+	wg.Wait()
+
+	if err != nil {
+		log.Printf("Failed to list objects for bucket path %s: %v\n", bucketPath, err)
+		*failedPaths = append(*failedPaths, bucketPath)
+	}
+}
+
 func main() {
 	bucketPaths := flag.String("bucket_paths", "", "Comma-separated list of S3 bucket paths to restore")
 	region := flag.String("region", "", "AWS region")
+	maxConcurrentOps := flag.Int64("max_concurrent_ops", 5, "Maximum number of concurrent operations")
 	flag.Parse()
 
 	if *bucketPaths == "" {
@@ -399,7 +467,12 @@ func main() {
 	}
 
 	for _, path := range bucketPathsList {
-		restoreObjectsInPath(path, *region, requestID, &failedPaths)
+		restoreObjectsInPath(path, *region, requestID, &failedPaths, *maxConcurrentOps)
+	}
+
+	// Verify the storage classes after all restores have been initiated
+	for _, path := range bucketPathsList {
+		verifyStorageClasses(path, *region, &failedPaths, *maxConcurrentOps)
 	}
 
 	if len(failedPaths) > 0 {
