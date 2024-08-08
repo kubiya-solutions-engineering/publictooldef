@@ -302,6 +302,24 @@ func restoreObject(svc *s3.S3, bucketName, key string) error {
 		time.Sleep(5 * time.Second)
 	}
 
+	// Use ListObjectsV2 to confirm the storage class
+	listParams := &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucketName),
+		Prefix: aws.String(key),
+	}
+
+	listOutput, err := svc.ListObjectsV2(listParams)
+	if err != nil {
+		return fmt.Errorf("failed to list objects for verification: %v", err)
+	}
+
+	for _, obj := range listOutput.Contents {
+		if *obj.Key == key && obj.StorageClass != nil && *obj.StorageClass == "STANDARD" {
+			log.Printf("Object %s restored to STANDARD storage class (verified via ListObjectsV2)\n", key)
+			return nil
+		}
+	}
+
 	return fmt.Errorf("storage class for object %s is not STANDARD, it is <nil>", key)
 }
 
