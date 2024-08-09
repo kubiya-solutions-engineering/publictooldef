@@ -382,7 +382,7 @@ func restoreObjectsInPath(bucketPath, requestID, restoreAction string, failedPat
 		}
 
 		for _, obj := range page.Contents {
-			if obj.StorageClass != s3types.StorageClassStandard {
+			if obj.StorageClass != s3types.ObjectStorageClassStandard {
 				wg.Add(1)
 				if err := sem.Acquire(context.Background(), 1); err != nil {
 					log.Printf("Failed to acquire semaphore: %v", err)
