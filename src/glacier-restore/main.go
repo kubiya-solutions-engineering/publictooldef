@@ -486,32 +486,37 @@ func renewCredentials(roleArn, region string) {
 
 func main() {
 	bucketPaths := flag.String("bucket_paths", "", "Comma-separated list of S3 bucket paths to restore")
-	region := flag.String("region", "", "AWS region")
 	restoreAction := flag.String("restore_action", "", "Specify the restore action. Pass a number of days to restore temporarily, or 'standard' to restore and move objects to STANDARD storage class.")
-	profile := flag.String("profile", "default", "AWS profile to use")
-	maxConcurrentOps := flag.Int64("max_concurrent_ops", 50, "Maximum number of concurrent operations")
+	maxConcurrentOps := flag.Int64("max_concurrent_ops", 5, "Maximum number of concurrent operations")
 	flag.Parse()
+
+	region := os.Getenv("AWS_DEFAULT_REGION")
+	if region == "" {
+		log.Fatal("AWS_DEFAULT_REGION environment variable is not set")
+	}
+
+	profile := os.Getenv("AWS_PROFILE")
+	if profile == "" {
+		profile = "default"
+	}
 
 	if *bucketPaths == "" {
 		log.Fatal("Please provide bucket paths")
 	}
-	if *region == "" {
-		log.Fatal("Please provide an AWS region")
-	}
 
-	roleArn, err := getRoleArnFromProfile(*profile)
+	roleArn, err := getRoleArnFromProfile(profile)
 	if err != nil {
 		log.Fatalf("Failed to get role ARN from profile: %v", err)
 	}
 
-	initialCreds, err := assumeRole(roleArn, *region)
+	initialCreds, err := assumeRole(roleArn, region)
 	if err != nil {
 		log.Fatalf("Failed to assume role: %v", err)
 	}
 
 	credsProvider = &customCredentialsProvider{creds: &initialCreds}
 
-	go renewCredentials(roleArn, *region)
+	go renewCredentials(roleArn, region)
 
 	requestID := generateRequestID()
 	bucketPathsList := strings.Split(*bucketPaths, ",")
@@ -527,7 +532,7 @@ func main() {
 
 	for _, path := range bucketPathsList {
 		wg.Add(1)
-		go restoreObjectsInPath(path, *region, requestID, &failedPaths, &wg, sem)
+		go restoreObjectsInPath(path, region, requestID, &failedPaths, &wg, sem)
 	}
 
 	wg.Wait()
@@ -537,7 +542,7 @@ func main() {
 			wg.Add(1)
 			go func(bucketPath string) {
 				defer wg.Done()
-				err = moveRestoredObjectsToStandard(bucketPath, *region, *maxConcurrentOps)
+				err = moveRestoredObjectsToStandard(bucketPath, region, *maxConcurrentOps)
 				if err != nil {
 					log.Printf("Error while moving objects to STANDARD storage class for path %s: %v", bucketPath, err)
 					failedPaths = append(failedPaths, bucketPath)
