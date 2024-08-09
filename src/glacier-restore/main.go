@@ -99,7 +99,7 @@ func createDBAndRecord(requestID string, bucketPaths []string) error {
 	processedPathsJSON, _ := json.Marshal([]string{})
 	insertQuery := `
 	INSERT INTO restore_requests (request_id, bucket_paths, processed_paths, created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?)` // Adjusted to insert only 5 values
+	VALUES (?, ?, ?, ?, ?)`
 	_, err = db.Exec(insertQuery, requestID, bucketPathsJSON, processedPathsJSON, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
 		return fmt.Errorf("failed to insert record: %w", err)
@@ -302,8 +302,8 @@ func restoreObject(svc *s3.S3, bucketName, key string, restoreAction string, sem
 
 	log.Printf("Object %s has been successfully requested for restoration.", key)
 
-	// If "standard" is specified, wait for restoration to complete, then move to STANDARD storage class
 	if restoreAction == "standard" {
+		log.Printf("Waiting for object %s to be fully restored before moving to STANDARD storage class.", key)
 		err := waitForRestoreCompletion(svc, bucketName, key)
 		if err != nil {
 			log.Printf("Error while waiting for restore completion: %v", err)
@@ -320,6 +320,12 @@ func restoreObject(svc *s3.S3, bucketName, key string, restoreAction string, sem
 			log.Printf("Failed to move object %s to STANDARD storage class: %v", key, err)
 		} else {
 			log.Printf("Object %s successfully moved to STANDARD storage class.", key)
+			sendSlackNotification(os.Getenv("SLACK_CHANNEL_ID"), os.Getenv("SLACK_THREAD_TS"), []slack.Block{
+				slack.NewSectionBlock(&slack.TextBlockObject{
+					Type: slack.MarkdownType,
+					Text: fmt.Sprintf(":white_check_mark: Object `%s` has been successfully restored and moved to `STANDARD` storage class.", key),
+				}, nil, nil),
+			})
 		}
 	}
 }
@@ -342,6 +348,12 @@ func waitForRestoreCompletion(svc *s3.S3, bucketName, key string) error {
 		}
 
 		log.Printf("Object %s is still being restored. Waiting for 30 seconds before retrying...", key)
+		sendSlackNotification(os.Getenv("SLACK_CHANNEL_ID"), os.Getenv("SLACK_THREAD_TS"), []slack.Block{
+			slack.NewSectionBlock(&slack.TextBlockObject{
+				Type: slack.MarkdownType,
+				Text: fmt.Sprintf(":hourglass_flowing_sand: Polling indicates that object `%s` is still being restored.", key),
+			}, nil, nil),
+		})
 		time.Sleep(30 * time.Second)
 	}
 }
