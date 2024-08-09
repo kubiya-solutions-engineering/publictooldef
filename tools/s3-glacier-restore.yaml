@@ -41,7 +41,7 @@ tools:
         description: The list of S3 bucket paths to restore, as a comma-separated string.
         required: true
       - name: restore_action
-        description: The action to take. Pass a number of days to restore temporarily, or "standard" to restore and move objects to STANDARD storage class.
+        description: Specify the restore action. Pass a number of days for temporary restore, or 'standard' to move objects to STANDARD storage class permanently.
         required: true
     env:
       - AWS_DEFAULT_REGION

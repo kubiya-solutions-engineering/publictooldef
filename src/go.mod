@@ -8,4 +8,5 @@ require (
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/mattn/go-sqlite3 v1.14.22 // indirect
 	github.com/slack-go/slack v0.13.1 // indirect
+	golang.org/x/sync v0.8.0 // indirect
 )
