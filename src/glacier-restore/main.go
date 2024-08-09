@@ -17,6 +17,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -33,10 +34,8 @@ type RestoreRequest struct {
 	UpdatedAt      string   `json:"updated_at"`
 }
 
-var (
-	messageTimestamp string
-	credsProvider    *customCredentialsProvider
-)
+var credsProvider *customCredentialsProvider
+var messageTimestamp string
 
 type customCredentialsProvider struct {
 	creds *aws.Credentials
@@ -294,29 +293,27 @@ func restoreObject(svc *s3.Client, bucketName, key string, restoreAction string,
 
 	log.Printf("Attempting to restore object: %s/%s", bucketName, key)
 
-	restoreRequest := &s3types.RestoreRequest{
-		Days: aws.Int32(7),
-		GlacierJobParameters: &s3types.GlacierJobParameters{
-			Tier: s3types.TierStandard,
+	restoreRequest := &s3.RestoreObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(key),
+		RestoreRequest: &s3types.RestoreRequest{
+			Days: aws.Int32(7),
+			GlacierJobParameters: &s3types.GlacierJobParameters{
+				Tier: s3types.TierStandard,
+			},
 		},
 	}
 
 	if restoreAction != "" && restoreAction != "standard" {
 		days, err := strconv.ParseInt(restoreAction, 10, 32)
 		if err == nil {
-			restoreRequest.Days = aws.Int32(int32(days))
+			restoreRequest.RestoreRequest.Days = aws.Int32(int32(days))
 		} else {
 			log.Printf("Invalid restore action passed: %s. Defaulting to 7 days.", restoreAction)
 		}
 	}
 
-	restoreObjectInput := &s3.RestoreObjectInput{
-		Bucket:         aws.String(bucketName),
-		Key:            aws.String(key),
-		RestoreRequest: restoreRequest,
-	}
-
-	_, err := svc.RestoreObject(context.TODO(), restoreObjectInput)
+	_, err := svc.RestoreObject(context.TODO(), restoreRequest)
 	if err != nil {
 		log.Printf("Failed to restore object %s: %v", key, err)
 		return
@@ -385,7 +382,7 @@ func restoreObjectsInPath(bucketPath, requestID, restoreAction string, failedPat
 		}
 
 		for _, obj := range page.Contents {
-			if obj.StorageClass != s3types.ObjectStorageClassStandard {
+			if obj.StorageClass != s3types.StorageClassStandard {
 				wg.Add(1)
 				if err := sem.Acquire(context.Background(), 1); err != nil {
 					log.Printf("Failed to acquire semaphore: %v", err)
@@ -406,7 +403,7 @@ func restoreObjectsInPath(bucketPath, requestID, restoreAction string, failedPat
 	}
 }
 
-func moveRestoredObjectsToStandard(bucketPath, region string, maxConcurrentOps int64) error {
+func moveRestoredObjectsToStandard(bucketPath string, maxConcurrentOps int64, region string) error {
 	log.Printf("Starting to move restored objects to STANDARD storage class for bucket path: %s\n", bucketPath)
 	parts := strings.SplitN(bucketPath, "/", 2)
 	if len(parts) < 2 {
@@ -436,7 +433,8 @@ func moveRestoredObjectsToStandard(bucketPath, region string, maxConcurrentOps i
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(context.TODO())
 		if err != nil {
-			return fmt.Errorf("Failed to list objects for bucket path %s: %v", bucketPath, err)
+			log.Printf("Failed to list objects for bucket path %s: %v\n", bucketPath, err)
+			return err
 		}
 
 		for _, obj := range page.Contents {
@@ -476,32 +474,43 @@ func moveRestoredObjectsToStandard(bucketPath, region string, maxConcurrentOps i
 	return err
 }
 
-func assumeRole(region string) (aws.Credentials, error) {
+func getRoleArnFromProfile(region string) (string, error) {
 	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
 	if err != nil {
-		return aws.Credentials{}, fmt.Errorf("failed to load AWS config: %v", err)
+		return "", fmt.Errorf("failed to load AWS config: %v", err)
 	}
 
-	stsSvc := sts.NewFromConfig(cfg)
+	stsClient := sts.NewFromConfig(cfg)
 
-	callerIdentity, err := stsSvc.GetCallerIdentity(context.TODO(), &sts.GetCallerIdentityInput{})
+	identity, err := stsClient.GetCallerIdentity(context.TODO(), &sts.GetCallerIdentityInput{})
 	if err != nil {
-		return aws.Credentials{}, fmt.Errorf("failed to get caller identity: %v", err)
+		return "", fmt.Errorf("failed to get caller identity: %v", err)
 	}
 
-	arn := *callerIdentity.Arn
+	return *identity.Arn, nil
+}
 
-	roleSessionName := fmt.Sprintf("kubiya-agent-s3-restore-%d", time.Now().Unix())
-	credsCache := aws.NewCredentialsCache(stscreds.NewAssumeRoleProvider(stsSvc, arn, func(p *stscreds.AssumeRoleOptions) {
-		p.RoleSessionName = roleSessionName
-	}))
+func assumeRole(region string) error {
+	roleArn, err := getRoleArnFromProfile(region)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+	if err != nil {
+		return fmt.Errorf("failed to load AWS config: %v", err)
+	}
+
+	stsClient := sts.NewFromConfig(cfg)
+	credsCache := aws.NewCredentialsCache(stscreds.NewAssumeRoleProvider(stsClient, roleArn))
 
 	creds, err := credsCache.Retrieve(context.TODO())
 	if err != nil {
-		return aws.Credentials{}, fmt.Errorf("failed to assume role: %v", err)
+		return fmt.Errorf("failed to assume role: %v", err)
 	}
 
-	return creds, nil
+	credsProvider = &customCredentialsProvider{creds: &creds}
+	return nil
 }
 
 func renewCredentials(region string) {
@@ -509,13 +518,11 @@ func renewCredentials(region string) {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		newCreds, err := assumeRole(region)
+		err := assumeRole(region)
 		if err != nil {
 			log.Printf("Failed to renew credentials: %v", err)
 			continue
 		}
-
-		credsProvider.UpdateCredentials(newCreds)
 
 		log.Println("Successfully renewed credentials")
 	}
@@ -536,13 +543,11 @@ func main() {
 		log.Fatal("Please provide bucket paths")
 	}
 
-	initialCreds, err := assumeRole(region)
+	// Assume the role and set up credentials renewal
+	err := assumeRole(region)
 	if err != nil {
 		log.Fatalf("Failed to assume role: %v", err)
 	}
-
-	credsProvider = &customCredentialsProvider{creds: &initialCreds}
-
 	go renewCredentials(region)
 
 	requestID := generateRequestID()
@@ -560,7 +565,7 @@ func main() {
 
 	if *restoreAction == "standard" {
 		for _, path := range bucketPathsList {
-			err = moveRestoredObjectsToStandard(path, region, *maxConcurrentOps)
+			err = moveRestoredObjectsToStandard(path, *maxConcurrentOps, region)
 			if err != nil {
 				log.Printf("Error while moving objects to STANDARD storage class for path %s: %v", path, err)
 				failedPaths = append(failedPaths, path)
