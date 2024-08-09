@@ -3,7 +3,7 @@ tools:
     image: golang:latest
     description: Initiates the restore process for objects from S3 Glacier/Deep Archive storage classes.
     alias: s3glacierrestore
-    long-running: true
+    long_running: true
     content: |
       # Set default values for environment variables
       REPO_BRANCH="main"
