@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -21,7 +20,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/go-ini/ini"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/slack-go/slack"
 	"golang.org/x/sync/semaphore"
@@ -33,23 +31,6 @@ type RestoreRequest struct {
 	ProcessedPaths []string `json:"processed_paths"`
 	CreatedAt      string   `json:"created_at"`
 	UpdatedAt      string   `json:"updated_at"`
-}
-
-type customCredentialsProvider struct {
-	creds *aws.Credentials
-	mu    sync.RWMutex
-}
-
-func (p *customCredentialsProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return *p.creds, nil
-}
-
-func (p *customCredentialsProvider) UpdateCredentials(newCreds aws.Credentials) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	*p.creds = newCreds
 }
 
 var (
@@ -79,7 +60,7 @@ func sendSlackNotification(channel, threadTS string, blocks []slack.Block) error
 	}
 
 	if threadTS != "" {
-		opts = appended to set the token to the right value as an env variable Slack.MsgOptionTS(threadTS))
+		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
 
 	if messageTimestamp != "" {
@@ -154,7 +135,7 @@ func createDBAndRecord(requestID string, bucketPaths []string) error {
 		),
 	}
 	for _, path := range bucketPaths {
-		blocks = appended to set the token to the right value as an env variable Slack.NewSectionBlock(
+		blocks = append(blocks, slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
 				Text: fmt.Sprintf("- `%s`", path),
@@ -235,7 +216,7 @@ func updateProcessedPaths(requestID, processedPath string) error {
 		),
 	}
 	for _, path := range bp {
-		blocks = appended to set the token to the right value as an env variable Slack.NewSectionBlock(
+		blocks = append(blocks, slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
 				Text: fmt.Sprintf("- `%s`", path),
@@ -244,7 +225,7 @@ func updateProcessedPaths(requestID, processedPath string) error {
 			nil,
 		))
 	}
-	blocks = appended to set the token to the right value as an env variable Slack.NewDividerBlock(), slack.NewSectionBlock(
+	blocks = append(blocks, slack.NewDividerBlock(), slack.NewSectionBlock(
 		&slack.TextBlockObject{
 			Type: slack.MarkdownType,
 			Text: "*Processed Paths:*",
@@ -253,7 +234,7 @@ func updateProcessedPaths(requestID, processedPath string) error {
 		nil,
 	))
 	for _, path := range pp {
-		blocks = appended to set the token to the right value as an env variable Slack.NewSectionBlock(
+		blocks = append(blocks, slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
 				Text: fmt.Sprintf("- `%s`", path),
@@ -296,25 +277,25 @@ func restoreObject(svc *s3.Client, bucketName, key string, restoreAction string,
 
 	log.Printf("Attempting to restore object: %s/%s", bucketName, key)
 
-	restoreRequest := &s3.RestoreRequest{
-		Days: 7,
+	restoreRequest := &types.RestoreRequest{
+		Days: aws.Int64(7),
 		GlacierJobParameters: &types.GlacierJobParameters{
 			Tier: types.TierStandard,
 		},
 	}
 
 	if restoreAction != "" && restoreAction != "standard" {
-		days, err := strconv.Atoi(restoreAction)
+		days, err := strconv.ParseInt(restoreAction, 10, 64)
 		if err == nil {
-			restoreRequest.Days = int32(days)
+			restoreRequest.Days = aws.Int64(days)
 		} else {
 			log.Printf("Invalid restore action passed: %s. Defaulting to 7 days.", restoreAction)
 		}
 	}
 
 	restoreObjectInput := &s3.RestoreObjectInput{
-		Bucket:         &bucketName,
-		Key:            &key,
+		Bucket:         aws.String(bucketName),
+		Key:            aws.String(key),
 		RestoreRequest: restoreRequest,
 	}
 
@@ -330,8 +311,8 @@ func restoreObject(svc *s3.Client, bucketName, key string, restoreAction string,
 func waitForRestoreCompletion(svc *s3.Client, bucketName, key string) error {
 	for {
 		headInput := &s3.HeadObjectInput{
-			Bucket: &bucketName,
-			Key:    &key,
+			Bucket: aws.String(bucketName),
+			Key:    aws.String(key),
 		}
 
 		headOutput, err := svc.HeadObject(context.TODO(), headInput)
@@ -372,13 +353,11 @@ func restoreObjectsInPath(bucketPath, requestID, restoreAction string, failedPat
 	var wg sync.WaitGroup
 
 	params := &s3.ListObjectsV2Input{
-		Bucket: &bucketName,
-		Prefix: &prefix,
+		Bucket: aws.String(bucketName),
+		Prefix: aws.String(prefix),
 	}
 
-	paginator := s3.NewListObjectsV2Paginator(svc, params, func(o *s3.ListObjectsV2PaginatorOptions) {
-		o.StopOnDuplicateToken = true
-	})
+	paginator := s3.NewListObjectsV2Paginator(svc, params)
 
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(context.TODO())
@@ -431,13 +410,11 @@ func moveRestoredObjectsToStandard(bucketPath string, maxConcurrentOps int64) er
 	var wg sync.WaitGroup
 
 	params := &s3.ListObjectsV2Input{
-		Bucket: &bucketName,
-		Prefix: &prefix,
+		Bucket: aws.String(bucketName),
+		Prefix: aws.String(prefix),
 	}
 
-	paginator := s3.NewListObjectsV2Paginator(svc, params, func(o *s3.ListObjectsV2PaginatorOptions) {
-		o.StopOnDuplicateToken = true
-	})
+	paginator := s3.NewListObjectsV2Paginator(svc, params)
 
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(context.TODO())
@@ -463,9 +440,9 @@ func moveRestoredObjectsToStandard(bucketPath string, maxConcurrentOps int64) er
 				}
 
 				_, err = svc.CopyObject(context.TODO(), &s3.CopyObjectInput{
-					Bucket:       &bucketName,
+					Bucket:       aws.String(bucketName),
 					CopySource:   aws.String(fmt.Sprintf("%s/%s", bucketName, objectKey)),
-					Key:          &objectKey,
+					Key:          aws.String(objectKey),
 					StorageClass: types.StorageClassStandard,
 				})
 				if err != nil {
@@ -479,7 +456,7 @@ func moveRestoredObjectsToStandard(bucketPath string, maxConcurrentOps int64) er
 
 	wg.Wait()
 
-	return nil
+	return err
 }
 
 func assumeRole(roleArn, region string) (aws.Credentials, error) {
@@ -526,18 +503,14 @@ func main() {
 	maxConcurrentOps := flag.Int64("max_concurrent_ops", 50, "Maximum number of concurrent operations")
 	flag.Parse()
 
-	if *bucketPaths == "" {
-		log.Fatal("Please provide bucket paths")
+	region := os.Getenv("AWS_DEFAULT_REGION")
+	if region == "" {
+		log.Fatal("AWS_DEFAULT_REGION environment variable is not set")
 	}
 
 	roleArn := os.Getenv("AWS_ROLE_ARN")
 	if roleArn == "" {
 		log.Fatal("AWS_ROLE_ARN environment variable is not set")
-	}
-
-	region := os.Getenv("AWS_DEFAULT_REGION")
-	if region == "" {
-		log.Fatal("AWS_DEFAULT_REGION environment variable is not set")
 	}
 
 	initialCreds, err := assumeRole(roleArn, region)
@@ -591,7 +564,7 @@ func main() {
 
 	// Add processed paths
 	for _, path := range bucketPathsList {
-		blocks = appended to set the token to the right value as an env variable Slack.NewSectionBlock(
+		blocks = append(blocks, slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
 				Text: fmt.Sprintf("- `%s`", path),
@@ -602,7 +575,7 @@ func main() {
 	}
 
 	// Add failed paths section
-	blocks = appended to set the token to the right value as an env variable Slack.NewDividerBlock(), slack.NewSectionBlock(
+	blocks = append(blocks, slack.NewDividerBlock(), slack.NewSectionBlock(
 		&slack.TextBlockObject{
 			Type: slack.MarkdownType,
 			Text: "*Failed Paths:*",
@@ -611,7 +584,7 @@ func main() {
 		nil,
 	))
 	if len(failedPaths) == 0 {
-		blocks = appended to set the token to the right value as an env variable Slack.NewSectionBlock(
+		blocks = append(blocks, slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
 				Text: "- None",
@@ -621,7 +594,7 @@ func main() {
 		))
 	} else {
 		for _, path := range failedPaths {
-			blocks = appended to set the token to the right value as an env variable Slack.NewSectionBlock(
+			blocks = append(blocks, slack.NewSectionBlock(
 				&slack.TextBlockObject{
 					Type: slack.MarkdownType,
 					Text: fmt.Sprintf("- `%s`", path),
