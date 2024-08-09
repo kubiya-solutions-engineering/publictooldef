@@ -1,4 +1,4 @@
-agent_name         = "RestoreTest"
+agent_name         = "GlacierRestoreTest"
 kubiya_runner      = "aks-mg"
 agent_description  = "This agent restores objects from Reduced Redundancy."
 agent_instructions = <<EOT

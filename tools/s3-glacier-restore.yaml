@@ -1,0 +1,64 @@
+tools:
+  - name: s3-glacier-restore
+    image: golang:latest
+    description: Initiates the restore process for objects from S3 Glacier and Deep Archive storage classes, with an option to move them to the STANDARD storage class.
+    alias: s3glacierrestore
+    long-running: true
+    content: |
+      # Set default values for environment variables
+      REPO_BRANCH="main"
+      GIT_ORG="kubiya-solutions-engineering"
+      REPO_NAME="${REPO_NAME:-publictooldef}"
+      SOURCE_CODE_DIR="${SOURCE_CODE_DIR:-/src/glacier-restore}"
+      REPO_DIR="${REPO_DIR:-$REPO_NAME}"
+      BIN_DIR="${BIN_DIR:-/usr/local/bin}"
+      APT_CACHE_DIR="${APT_CACHE_DIR:-/var/cache/apt/archives}"
+      PIP_CACHE_DIR="${PIP_CACHE_DIR:-/var/cache/pip}"
+
+      # Create cache directories
+      mkdir -p "$APT_CACHE_DIR"
+      mkdir -p "$BIN_DIR"
+      mkdir -p "$PIP_CACHE_DIR"
+
+      # Clone repository if not already cloned
+      if [ ! -d "$REPO_DIR" ]; then
+          git clone -b "$REPO_BRANCH" https://"$TOOLS_GH_TOKEN"@github.com/"$GIT_ORG"/"$REPO_NAME".git $REPO_DIR
+        else
+          git clone --branch "$REPO_BRANCH" "$REPO_URL" "$REPO_DIR" > /dev/null
+      fi
+
+      # cd into the cloned repo
+      cd "${REPO_DIR}/${SOURCE_CODE_DIR}"
+
+      # Build the Go script
+      go get -d ./...
+      go build -o s3-restore
+
+      # Make the Go script executable and run it
+      export PATH="${PATH}:/${REPO_DIR}/${SOURCE_CODE_DIR}"
+      exec ./s3-restore --bucket_paths "{{ .bucket_paths }}" --ttl "{{ .ttl }}"
+    args:
+      - name: bucket_paths
+        description: The list of S3 bucket paths to restore, as a comma-separated string.
+        required: true
+      - name: ttl
+        description: |
+          Time-to-live (TTL) in days for restored objects before reverting to their original storage class. 
+          - If a number of days is provided (e.g., 7), the objects will be restored temporarily for that duration.
+          - If "standard" is passed, the objects will be permanently restored and moved to the STANDARD storage class.
+        required: true
+    env:
+      - AWS_DEFAULT_REGION
+      - SLACK_API_TOKEN
+      - SLACK_CHANNEL_ID
+      - SLACK_THREAD_TS
+      - KUBIYA_AGENT_UUID
+      - KUBIYA_USER_ORG
+      - KUBIYA_API_KEY
+      - TOOLS_GH_TOKEN
+    with_volumes:
+      - name: sqlite_data
+        path: /sqlite_data
+    with_files:
+      - source: /$HOME/.aws/credentials
+        destination: /root/.aws/credentials

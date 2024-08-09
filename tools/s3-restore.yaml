@@ -5,10 +5,10 @@ tools:
     alias: s3restore
     content: |
       # Set default values for environment variables
-      REPO_URL="${REPO_URL:-https://github.com/kubiya-solutions-engineering/publictooldef}"
-      REPO_NAME="${REPO_NAME:-publictooldef}"
-      SOURCE_CODE_DIR="${SOURCE_CODE_DIR:-src}"
-      REPO_BRANCH="${REPO_BRANCH:-main}"
+      REPO_BRANCH="main"
+      GIT_ORG="verana-health"
+      REPO_NAME="${REPO_NAME:-kubi-tools}"
+      SOURCE_CODE_DIR="${SOURCE_CODE_DIR:-/src}"
       REPO_DIR="${REPO_DIR:-$REPO_NAME}"
       BIN_DIR="${BIN_DIR:-/usr/local/bin}"
       APT_CACHE_DIR="${APT_CACHE_DIR:-/var/cache/apt/archives}"
@@ -21,15 +21,9 @@ tools:
 
       # Clone repository if not already cloned
       if [ ! -d "$REPO_DIR" ]; then
-        if [ -n "$TOOLS_GH_TOKEN" ]; then
-          GIT_ASKPASS_ENV=$(mktemp)
-          chmod +x "$GIT_ASKPASS_ENV"
-          echo -e "#!/bin/sh\necho \$TOOLS_GH_TOKEN" > "$GIT_ASKPASS_ENV"
-          GIT_ASKPASS="$GIT_ASKPASS_ENV" git clone --branch "$REPO_BRANCH" "https://$TOOLS_GH_TOKEN@$(echo $REPO_URL | sed 's|https://||')" "$REPO_DIR" > /dev/null
-          rm "$GIT_ASKPASS_ENV"
+          git clone -b "$REPO_BRANCH" https://"$TOOLS_GH_TOKEN"@github.com/"$GIT_ORG"/"$REPO_NAME".git $REPO_DIR
         else
           git clone --branch "$REPO_BRANCH" "$REPO_URL" "$REPO_DIR" > /dev/null
-        fi
       fi
 
       # cd into the cloned repo

@@ -32,6 +32,7 @@ resource "kubiya_agent" "agent" {
       LOG_LEVEL              = var.log_level
       KUBIYA_TOOL_TIMEOUT    = "5m"
       KUBIYA_TOOL_CONFIG_URLS = "https://github.com/kubiya-solutions-engineering/publictooldef"
+      AWS_DEFAULT_REGION     = "us-east-1"
     },
     var.debug ? { KUBIYA_DEBUG = "1" } : {},
     var.dry_run ? { DRY_RUN_ENABLED = "1" } : {}
