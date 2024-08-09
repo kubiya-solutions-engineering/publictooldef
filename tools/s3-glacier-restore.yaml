@@ -45,6 +45,7 @@ tools:
         required: true
     env:
       - AWS_DEFAULT_REGION
+      - AWS_PROFILE
       - SLACK_API_TOKEN
       - SLACK_CHANNEL_ID
       - SLACK_THREAD_TS
