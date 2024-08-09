@@ -298,7 +298,7 @@ func restoreObject(svc *s3.Client, bucketName, key string, restoreAction string,
 	log.Printf("Attempting to restore object: %s/%s", bucketName, key)
 
 	restoreRequest := &types.RestoreRequest{
-		Days: aws.Int32(7),
+		Days: 7,
 		GlacierJobParameters: &types.GlacierJobParameters{
 			Tier: types.TierStandard,
 		},
@@ -307,15 +307,15 @@ func restoreObject(svc *s3.Client, bucketName, key string, restoreAction string,
 	if restoreAction != "" && restoreAction != "standard" {
 		days, err := strconv.ParseInt(restoreAction, 10, 32)
 		if err == nil {
-			restoreRequest.Days = aws.Int32(int32(days))
+			restoreRequest.Days = int32(days)
 		} else {
 			log.Printf("Invalid restore action passed: %s. Defaulting to 7 days.", restoreAction)
 		}
 	}
 
 	restoreObjectInput := &s3.RestoreObjectInput{
-		Bucket:         aws.String(bucketName),
-		Key:            aws.String(key),
+		Bucket:         &bucketName,
+		Key:            &key,
 		RestoreRequest: restoreRequest,
 	}
 
@@ -331,8 +331,8 @@ func restoreObject(svc *s3.Client, bucketName, key string, restoreAction string,
 func waitForRestoreCompletion(svc *s3.Client, bucketName, key string) error {
 	for {
 		headInput := &s3.HeadObjectInput{
-			Bucket: aws.String(bucketName),
-			Key:    aws.String(key),
+			Bucket: &bucketName,
+			Key:    &key,
 		}
 
 		headOutput, err := svc.HeadObject(context.TODO(), headInput)
@@ -373,11 +373,13 @@ func restoreObjectsInPath(bucketPath, requestID, restoreAction string, failedPat
 	var wg sync.WaitGroup
 
 	params := &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucketName),
-		Prefix: aws.String(prefix),
+		Bucket: &bucketName,
+		Prefix: &prefix,
 	}
 
-	paginator := s3.NewListObjectsV2Paginator(svc, params)
+	paginator := s3.NewListObjectsV2Paginator(svc, params, func(o *s3.ListObjectsV2PaginatorOptions) {
+		o.Limit = 1000
+	})
 
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(context.TODO())
@@ -388,7 +390,7 @@ func restoreObjectsInPath(bucketPath, requestID, restoreAction string, failedPat
 		}
 
 		for _, obj := range page.Contents {
-			if obj.StorageClass != types.ObjectStorageClassStandard {
+			if obj.StorageClass != types.StorageClassStandard {
 				wg.Add(1)
 				if err := sem.Acquire(context.Background(), 1); err != nil {
 					log.Printf("Failed to acquire semaphore: %v", err)
@@ -430,11 +432,13 @@ func moveRestoredObjectsToStandard(bucketPath string, maxConcurrentOps int64) er
 	var wg sync.WaitGroup
 
 	params := &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucketName),
-		Prefix: aws.String(prefix),
+		Bucket: &bucketName,
+		Prefix: &prefix,
 	}
 
-	paginator := s3.NewListObjectsV2Paginator(svc, params)
+	paginator := s3.NewListObjectsV2Paginator(svc, params, func(o *s3.ListObjectsV2PaginatorOptions) {
+		o.Limit = 1000
+	})
 
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(context.TODO())
@@ -460,9 +464,9 @@ func moveRestoredObjectsToStandard(bucketPath string, maxConcurrentOps int64) er
 				}
 
 				_, err = svc.CopyObject(context.TODO(), &s3.CopyObjectInput{
-					Bucket:       aws.String(bucketName),
+					Bucket:       &bucketName,
 					CopySource:   aws.String(fmt.Sprintf("%s/%s", bucketName, objectKey)),
-					Key:          aws.String(objectKey),
+					Key:          &objectKey,
 					StorageClass: types.StorageClassStandard,
 				})
 				if err != nil {
@@ -476,7 +480,27 @@ func moveRestoredObjectsToStandard(bucketPath string, maxConcurrentOps int64) er
 
 	wg.Wait()
 
-	return nil
+	return err
+}
+
+func getRoleArnFromProfile(profile string) (string, error) {
+	credsFile := filepath.Join(os.Getenv("HOME"), ".aws", "credentials")
+	cfg, err := ini.Load(credsFile)
+	if err != nil {
+		return "", fmt.Errorf("failed to load AWS credentials file: %v", err)
+	}
+
+	section, err := cfg.GetSection(profile)
+	if err != nil {
+		return "", fmt.Errorf("failed to get profile %s: %v", profile, err)
+	}
+
+	roleArn, err := section.GetKey("role_arn")
+	if err != nil {
+		return "", fmt.Errorf("failed to get role_arn from profile %s: %v", profile, err)
+	}
+
+	return roleArn.String(), nil
 }
 
 func assumeRole(roleArn, region string) (aws.Credentials, error) {
@@ -517,54 +541,30 @@ func renewCredentials(roleArn, region string) {
 	}
 }
 
-func getRoleArnFromProfile(profile string) (string, error) {
-	credsFile := filepath.Join(os.Getenv("HOME"), ".aws", "credentials")
-	cfg, err := ini.Load(credsFile)
-	if err != nil {
-		return "", fmt.Errorf("failed to load AWS credentials file: %v", err)
-	}
-
-	section, err := cfg.GetSection(profile)
-	if err != nil {
-		return "", fmt.Errorf("failed to get profile %s: %v", profile, err)
-	}
-
-	roleArn, err := section.GetKey("role_arn")
-	if err != nil {
-		return "", fmt.Errorf("failed to get role_arn from profile %s: %v", profile, err)
-	}
-
-	return roleArn.String(), nil
-}
-
 func main() {
 	bucketPaths := flag.String("bucket_paths", "", "Comma-separated list of S3 bucket paths to restore")
 	restoreAction := flag.String("restore_action", "", "Specify the restore action. Pass a number of days to restore temporarily, or 'standard' to restore and move objects to STANDARD storage class.")
 	maxConcurrentOps := flag.Int64("max_concurrent_ops", 50, "Maximum number of concurrent operations")
+	profile := flag.String("profile", "default", "AWS profile to use")
 	flag.Parse()
-
-	region := os.Getenv("AWS_DEFAULT_REGION")
-	if region == "" {
-		log.Fatal("AWS_DEFAULT_REGION environment variable is not set")
-	}
 
 	if *bucketPaths == "" {
 		log.Fatal("Please provide bucket paths")
 	}
 
-	roleArn, err := getRoleArnFromProfile(os.Getenv("AWS_PROFILE"))
+	roleArn, err := getRoleArnFromProfile(*profile)
 	if err != nil {
 		log.Fatalf("Failed to get role ARN from profile: %v", err)
 	}
 
-	initialCreds, err := assumeRole(roleArn, region)
+	initialCreds, err := assumeRole(roleArn, os.Getenv("AWS_DEFAULT_REGION"))
 	if err != nil {
 		log.Fatalf("Failed to assume role: %v", err)
 	}
 
 	credsProvider = &customCredentialsProvider{creds: &initialCreds}
 
-	go renewCredentials(roleArn, region)
+	go renewCredentials(roleArn, os.Getenv("AWS_DEFAULT_REGION"))
 
 	requestID := generateRequestID()
 	bucketPathsList := strings.Split(*bucketPaths, ",")
@@ -619,14 +619,6 @@ func main() {
 	}
 
 	// Add failed paths section
-	blocks = append(blocks, slack.NewDividerBlock(), slack.NewSectionBlock(
-		&slack.TextBlockObject{
-			Type: slack.MarkdownType,
-			Text: "*Failed Paths:*",
-		},
-		nil,
-		nil,
-	))
 	if len(failedPaths) == 0 {
 		blocks = append(blocks, slack.NewSectionBlock(
 			&slack.TextBlockObject{
