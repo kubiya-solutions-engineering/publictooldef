@@ -99,7 +99,7 @@ func createDBAndRecord(requestID string, bucketPaths []string) error {
 	processedPathsJSON, _ := json.Marshal([]string{})
 	insertQuery := `
 	INSERT INTO restore_requests (request_id, bucket_paths, processed_paths, created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?)`
+	VALUES (?, ?, ?, ?, ?)` // Adjusted to insert only 5 values
 	_, err = db.Exec(insertQuery, requestID, bucketPathsJSON, processedPathsJSON, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
 		return fmt.Errorf("failed to insert record: %w", err)
@@ -302,8 +302,8 @@ func restoreObject(svc *s3.S3, bucketName, key string, restoreAction string, sem
 
 	log.Printf("Object %s has been successfully requested for restoration.", key)
 
+	// If "standard" is specified, wait for restoration to complete, then move to STANDARD storage class
 	if restoreAction == "standard" {
-		log.Printf("Waiting for object %s to be fully restored before moving to STANDARD storage class.", key)
 		err := waitForRestoreCompletion(svc, bucketName, key)
 		if err != nil {
 			log.Printf("Error while waiting for restore completion: %v", err)
@@ -320,12 +320,6 @@ func restoreObject(svc *s3.S3, bucketName, key string, restoreAction string, sem
 			log.Printf("Failed to move object %s to STANDARD storage class: %v", key, err)
 		} else {
 			log.Printf("Object %s successfully moved to STANDARD storage class.", key)
-			sendSlackNotification(os.Getenv("SLACK_CHANNEL_ID"), os.Getenv("SLACK_THREAD_TS"), []slack.Block{
-				slack.NewSectionBlock(&slack.TextBlockObject{
-					Type: slack.MarkdownType,
-					Text: fmt.Sprintf(":white_check_mark: Object `%s` has been successfully restored and moved to `STANDARD` storage class.", key),
-				}, nil, nil),
-			})
 		}
 	}
 }
@@ -347,14 +341,65 @@ func waitForRestoreCompletion(svc *s3.S3, bucketName, key string) error {
 			return nil
 		}
 
-		log.Printf("Object %s is still being restored. Waiting for 30 seconds before retrying...", key)
-		sendSlackNotification(os.Getenv("SLACK_CHANNEL_ID"), os.Getenv("SLACK_THREAD_TS"), []slack.Block{
-			slack.NewSectionBlock(&slack.TextBlockObject{
-				Type: slack.MarkdownType,
-				Text: fmt.Sprintf(":hourglass_flowing_sand: Polling indicates that object `%s` is still being restored.", key),
-			}, nil, nil),
-		})
-		time.Sleep(30 * time.Second)
+		log.Printf("Object %s is still being restored. Waiting for 15 minutes before retrying...", key)
+		time.Sleep(15 * time.Minute)
+	}
+}
+
+func pollRestorationCompletion(svc *s3.S3, bucketName string, keys []string, maxPollTime time.Duration) {
+	timeout := time.After(maxPollTime)
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeout:
+			log.Println("Polling timeout reached, sending error to Slack.")
+			// Send error message to Slack
+			blocks := []slack.Block{
+				slack.NewHeaderBlock(&slack.TextBlockObject{
+					Type: slack.PlainTextType,
+					Text: ":x: Polling timeout reached",
+				}),
+				slack.NewSectionBlock(
+					&slack.TextBlockObject{
+						Type: slack.MarkdownType,
+						Text: fmt.Sprintf("Polling has been ongoing for the past 12 hours, but some objects are still not restored. Please investigate the situation for the following bucket path: `%s`", bucketName),
+					},
+					nil,
+					nil,
+				),
+			}
+			sendSlackNotification(os.Getenv("SLACK_CHANNEL_ID"), os.Getenv("SLACK_THREAD_TS"), blocks)
+			return
+		case <-ticker.C:
+			allRestored := true
+			for _, key := range keys {
+				err := waitForRestoreCompletion(svc, bucketName, key)
+				if err != nil {
+					allRestored = false
+					log.Printf("Object %s is still being restored.", key)
+				}
+			}
+			if allRestored {
+				log.Println("All objects restored. Proceeding to move them to STANDARD storage class.")
+				// Move objects to STANDARD
+				for _, key := range keys {
+					_, err := svc.CopyObject(&s3.CopyObjectInput{
+						Bucket:       aws.String(bucketName),
+						CopySource:   aws.String(fmt.Sprintf("%s/%s", bucketName, key)),
+						Key:          aws.String(key),
+						StorageClass: aws.String("STANDARD"),
+					})
+					if err != nil {
+						log.Printf("Failed to move object %s to STANDARD storage class: %v", key, err)
+					} else {
+						log.Printf("Object %s successfully moved to STANDARD storage class.", key)
+					}
+				}
+				return
+			}
+		}
 	}
 }
 
@@ -384,11 +429,14 @@ func restoreObjectsInPath(bucketPath, region, requestID, restoreAction string, f
 		Prefix: aws.String(prefix),
 	}
 
+	var keysToPoll []string
+
 	err = svc.ListObjectsV2Pages(params, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
 		log.Printf("Listing objects in bucket path: %s\n", bucketPath)
 		for _, obj := range page.Contents {
 			if obj.StorageClass != nil && (*obj.StorageClass == "DEEP_ARCHIVE" || *obj.StorageClass == "GLACIER") {
 				wg.Add(1)
+				keysToPoll = append(keysToPoll, *obj.Key)
 				if err := sem.Acquire(context.Background(), 1); err != nil {
 					log.Printf("Failed to acquire semaphore: %v", err)
 					wg.Done()
@@ -412,6 +460,12 @@ func restoreObjectsInPath(bucketPath, region, requestID, restoreAction string, f
 	if err != nil {
 		log.Printf("Failed to update processed paths for Request ID %s: %v\n", requestID, err)
 		*failedPaths = append(*failedPaths, bucketPath)
+	}
+
+	// If "standard" is specified, poll for completion and move objects to STANDARD storage class
+	if restoreAction == "standard" && len(keysToPoll) > 0 {
+		log.Printf("Starting polling for restoration completion for bucket path: %s", bucketPath)
+		pollRestorationCompletion(svc, bucketName, keysToPoll, 12*time.Hour)
 	}
 }
 
@@ -473,7 +527,7 @@ func main() {
 	}
 
 	// Add failed paths section
-	blocks = append(blocks, slack.NewDividerBlock(), slack.NewSectionBlock(
+	blocks are appended(slack.NewDividerBlock(), slack.NewSectionBlock(
 		&slack.TextBlockObject{
 			Type: slack.MarkdownType,
 			Text: "*Failed Paths:*",
