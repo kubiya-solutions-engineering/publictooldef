@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,10 +34,25 @@ type RestoreRequest struct {
 	UpdatedAt      string   `json:"updated_at"`
 }
 
-var (
-	messageTimestamp string
-	credsProvider    *customCredentialsProvider
-)
+type customCredentialsProvider struct {
+	creds aws.Credentials
+	mu    sync.RWMutex
+}
+
+func (p *customCredentialsProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.creds, nil
+}
+
+func (p *customCredentialsProvider) UpdateCredentials(newCreds aws.Credentials) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.creds = newCreds
+}
+
+var messageTimestamp string
+var credsProvider *customCredentialsProvider
 
 func generateRequestID() string {
 	bytes := make([]byte, 16)
@@ -278,16 +294,16 @@ func restoreObject(svc *s3.Client, bucketName, key string, restoreAction string,
 	log.Printf("Attempting to restore object: %s/%s", bucketName, key)
 
 	restoreRequest := &types.RestoreRequest{
-		Days: aws.Int64(7),
+		Days: aws.Int32(7),
 		GlacierJobParameters: &types.GlacierJobParameters{
 			Tier: types.TierStandard,
 		},
 	}
 
 	if restoreAction != "" && restoreAction != "standard" {
-		days, err := strconv.ParseInt(restoreAction, 10, 64)
+		days, err := strconv.ParseInt(restoreAction, 10, 32)
 		if err == nil {
-			restoreRequest.Days = aws.Int64(days)
+			restoreRequest.Days = aws.Int32(int32(days))
 		} else {
 			log.Printf("Invalid restore action passed: %s. Defaulting to 7 days.", restoreAction)
 		}
@@ -345,7 +361,7 @@ func restoreObjectsInPath(bucketPath, requestID, restoreAction string, failedPat
 		config.WithCredentialsProvider(credsProvider),
 	)
 	if err != nil {
-		log.Fatalf("Failed to load AWS config: %v\n", err)
+		log.Fatalf("Failed to create session: %v\n", err)
 	}
 
 	svc := s3.NewFromConfig(cfg)
@@ -402,7 +418,7 @@ func moveRestoredObjectsToStandard(bucketPath string, maxConcurrentOps int64) er
 		config.WithCredentialsProvider(credsProvider),
 	)
 	if err != nil {
-		return fmt.Errorf("Failed to load AWS config: %w", err)
+		return fmt.Errorf("Failed to create session: %w", err)
 	}
 
 	svc := s3.NewFromConfig(cfg)
@@ -456,7 +472,7 @@ func moveRestoredObjectsToStandard(bucketPath string, maxConcurrentOps int64) er
 
 	wg.Wait()
 
-	return err
+	return nil
 }
 
 func assumeRole(roleArn, region string) (aws.Credentials, error) {
@@ -518,9 +534,13 @@ func main() {
 		log.Fatalf("Failed to assume role: %v", err)
 	}
 
-	credsProvider = &customCredentialsProvider{creds: &initialCreds}
+	credsProvider = &customCredentialsProvider{creds: initialCreds}
 
 	go renewCredentials(roleArn, region)
+
+	if *bucketPaths == "" {
+		log.Fatal("Please provide bucket paths")
+	}
 
 	requestID := generateRequestID()
 	bucketPathsList := strings.Split(*bucketPaths, ",")
