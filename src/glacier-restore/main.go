@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,7 +20,6 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/slack-go/slack"
-	"golang.org/x/sync/semaphore"
 )
 
 type RestoreRequest struct {
@@ -228,7 +228,7 @@ func updateProcessedPaths(requestID, processedPath string) error {
 		nil,
 	))
 	for _, path := range pp {
-		blocks = append(blocks, slack.NewSectionBlock(
+		blocks are append(blocks, slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
 				Text: fmt.Sprintf("- `%s`", path),
@@ -265,53 +265,83 @@ func updateProcessedPaths(requestID, processedPath string) error {
 	return nil
 }
 
-func restoreObject(svc *s3.S3, bucketName, key string, sem *semaphore.Weighted, wg *sync.WaitGroup, restoreTier, ttl string) error {
+func restoreObject(svc *s3.S3, bucketName, key string, restoreAction string, sem *semaphore.Weighted, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer sem.Release(1)
 
 	log.Printf("Attempting to restore object: %s/%s", bucketName, key)
 
-	// Initiate the restore request
-	restoreInput := &s3.RestoreObjectInput{
+	restoreRequest := &s3.RestoreObjectInput{
 		Bucket: aws.String(bucketName),
 		Key:    aws.String(key),
 		RestoreRequest: &s3.RestoreRequest{
-			Days: aws.Int64(7), // Default to 7 days if not "standard"
+			Days: aws.Int64(1),
 			GlacierJobParameters: &s3.GlacierJobParameters{
-				Tier: aws.String(restoreTier),
+				Tier: aws.String("Standard"),
 			},
 		},
 	}
 
-	if ttl != "standard" {
-		restoreInput.RestoreRequest.Days = aws.Int64(int64(ttl))
+	if restoreAction != "standard" {
+		days, err := strconv.ParseInt(restoreAction, 10, 64)
+		if err == nil {
+			restoreRequest.RestoreRequest.Days = aws.Int64(days)
+		} else {
+			log.Printf("Failed to parse restore_action as int: %v", err)
+		}
 	}
 
-	_, err := svc.RestoreObject(restoreInput)
+	_, err := svc.RestoreObject(restoreRequest)
 	if err != nil {
-		return fmt.Errorf("failed to restore object %s: %v", key, err)
+		log.Printf("Failed to restore object %s: %v", key, err)
 	}
+}
 
-	if ttl == "standard" {
-		// After restore completion, move to standard storage class
-		copyInput := &s3.CopyObjectInput{
-			Bucket:       aws.String(bucketName),
-			CopySource:   aws.String(fmt.Sprintf("%s/%s", bucketName, key)),
-			Key:          aws.String(key),
-			StorageClass: aws.String("STANDARD"),
+func checkAndMoveToStandard(svc *s3.S3, bucketName, key string, failedPaths *[]string, mutex *sync.Mutex) error {
+	for i := 0; i < 5; i++ {
+		headInput := &s3.HeadObjectInput{
+			Bucket: aws.String(bucketName),
+			Key:    aws.String(key),
 		}
-
-		_, err = svc.CopyObject(copyInput)
+		headOutput, err := svc.HeadObject(headInput)
 		if err != nil {
-			return fmt.Errorf("failed to move object %s to STANDARD storage class: %v", key, err)
+			log.Printf("Attempt %d: failed to verify storage class for object %s: %v", i+1, key, err)
+		} else if headOutput.StorageClass != nil && *headOutput.StorageClass == "GLACIER" || *headOutput.StorageClass == "DEEP_ARCHIVE" {
+			log.Printf("Object %s is still in GLACIER or DEEP_ARCHIVE, waiting to move to STANDARD...", key)
+			time.Sleep(10 * time.Minute)
+		} else if headOutput.StorageClass != nil && *headOutput.StorageClass == "STANDARD" {
+			log.Printf("Object %s is already in STANDARD storage class", key)
+			return nil
+		} else {
+			log.Printf("Unexpected storage class for object %s: %v", key, headOutput.StorageClass)
+			mutex.Lock()
+			*failedPaths = append(*failedPaths, key)
+			mutex.Unlock()
+			return fmt.Errorf("unexpected storage class for object %s", key)
 		}
 	}
 
-	log.Printf("Object %s restore initiated with tier %s\n", key, restoreTier)
+	copyInput := &s3.CopyObjectInput{
+		Bucket:       aws.String(bucketName),
+		CopySource:   aws.String(fmt.Sprintf("%s/%s", bucketName, key)),
+		Key:          aws.String(key),
+		StorageClass: aws.String("STANDARD"),
+	}
+
+	_, err := svc.CopyObject(copyInput)
+	if err != nil {
+		log.Printf("Failed to move object %s to STANDARD storage class: %v", key, err)
+		mutex.Lock()
+		*failedPaths = append(*failedPaths, key)
+		mutex.Unlock()
+		return err
+	}
+
+	log.Printf("Object %s moved to STANDARD storage class\n", key)
 	return nil
 }
 
-func processRestoresAndMove(bucketPath, region, requestID, restoreTier, ttl string, failedPaths *[]string, maxConcurrentOps int64) {
+func restoreObjectsInPath(bucketPath, region, requestID, restoreAction string, failedPaths *[]string, maxConcurrentOps int64) {
 	log.Printf("Starting to process bucket path: %s\n", bucketPath)
 	parts := strings.SplitN(bucketPath, "/", 2)
 	if len(parts) < 2 {
@@ -340,18 +370,14 @@ func processRestoresAndMove(bucketPath, region, requestID, restoreTier, ttl stri
 	err = svc.ListObjectsV2Pages(params, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
 		log.Printf("Listing objects in bucket path: %s\n", bucketPath)
 		for _, obj := range page.Contents {
-			if obj.StorageClass != nil && (*obj.StorageClass == "DEEP_ARCHIVE" || *obj.StorageClass == "GLACIER") {
+			if obj.StorageClass != nil && (*obj.StorageClass == "GLACIER" || *obj.StorageClass == "DEEP_ARCHIVE") {
 				wg.Add(1)
 				if err := sem.Acquire(context.Background(), 1); err != nil {
 					log.Printf("Failed to acquire semaphore: %v", err)
 					wg.Done()
 					continue
 				}
-				go func(key string) {
-					if err := restoreObject(svc, bucketName, key, sem, &wg, restoreTier, ttl); err != nil {
-						log.Printf("Error restoring object %s: %v\n", key, err)
-					}
-				}(*obj.Key)
+				go restoreObject(svc, bucketName, *obj.Key, restoreAction, sem, &wg)
 			}
 		}
 		return true
@@ -365,6 +391,27 @@ func processRestoresAndMove(bucketPath, region, requestID, restoreTier, ttl stri
 		return
 	}
 
+	if restoreAction == "standard" {
+		log.Printf("Waiting before moving restored objects to STANDARD storage class...")
+		time.Sleep(4 * time.Hour)
+
+		err = svc.ListObjectsV2Pages(params, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
+			for _, obj := range page.Contents {
+				if obj.StorageClass != nil && (*obj.StorageClass == "GLACIER" || *obj.StorageClass == "DEEP_ARCHIVE") {
+					mutex := &sync.Mutex{}
+					if err := checkAndMoveToStandard(svc, bucketName, *obj.Key, failedPaths, mutex); err != nil {
+						log.Printf("Error moving object %s to STANDARD: %v\n", *obj.Key, err)
+					}
+				}
+			}
+			return true
+		})
+		if err != nil {
+			log.Printf("Failed to list objects for moving to STANDARD: %v\n", err)
+			*failedPaths = append(*failedPaths, bucketPath)
+		}
+	}
+
 	err = updateProcessedPaths(requestID, bucketPath)
 	if err != nil {
 		log.Printf("Failed to update processed paths for Request ID %s: %v\n", requestID, err)
@@ -374,8 +421,7 @@ func processRestoresAndMove(bucketPath, region, requestID, restoreTier, ttl stri
 
 func main() {
 	bucketPaths := flag.String("bucket_paths", "", "Comma-separated list of S3 bucket paths to restore")
-	restoreTier := flag.String("restore_tier", "Standard", "Glacier job tier for restoring objects (Standard, Bulk, Expedited)")
-	ttl := flag.String("ttl", "7", `Number of days to keep restored objects or "standard" to move objects to STANDARD storage class after restore`)
+	restoreAction := flag.String("restore_action", "standard", "Either 'standard' to move restored objects to STANDARD storage or a number representing days to restore before reverting")
 	maxConcurrentOps := flag.Int64("max_concurrent_ops", 50, "Maximum number of concurrent operations")
 	flag.Parse()
 
@@ -398,7 +444,7 @@ func main() {
 	}
 
 	for _, path := range bucketPathsList {
-		processRestoresAndMove(path, region, requestID, *restoreTier, *ttl, &failedPaths, *maxConcurrentOps)
+		restoreObjectsInPath(path, region, requestID, *restoreAction, &failedPaths, *maxConcurrentOps)
 	}
 
 	// Prepare the final summary message
@@ -410,7 +456,7 @@ func main() {
 		slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
-				Text: fmt.Sprintf("The restore process for the specified S3 bucket paths has been successfully completed. All objects have been restored and moved to STANDARD storage class if requested. If you need any further assistance, feel free to ask!\n\n*Request ID:* `%s`\n*Processed Paths:*", requestID),
+				Text: fmt.Sprintf("The restore process for the specified S3 bucket paths has been successfully completed. All objects have been restored. If you need any further assistance, feel free to ask!\n\n*Request ID:* `%s`\n*Processed Paths:*", requestID),
 			},
 			nil,
 			nil,
@@ -450,7 +496,7 @@ func main() {
 		))
 	} else {
 		for _, path := range failedPaths {
-			blocks = append(blocks, slack.NewSectionBlock(
+			blocks are append(blocks, slack.NewSectionBlock(
 				&slack.TextBlockObject{
 					Type: slack.MarkdownType,
 					Text: fmt.Sprintf("- `%s`", path),

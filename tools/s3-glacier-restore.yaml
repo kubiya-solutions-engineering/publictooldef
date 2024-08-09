@@ -1,9 +1,8 @@
 tools:
   - name: s3-glacier-restore
     image: golang:latest
-    description: Initiates the restore process for objects from S3 Glacier and Deep Archive storage classes, with an option to move them to the STANDARD storage class.
+    description: Initiates the restore process for objects from S3 Glacier/Deep Archive storage classes.
     alias: s3glacierrestore
-    long-running: true
     content: |
       # Set default values for environment variables
       REPO_BRANCH="main"
@@ -36,16 +35,13 @@ tools:
 
       # Make the Go script executable and run it
       export PATH="${PATH}:/${REPO_DIR}/${SOURCE_CODE_DIR}"
-      exec ./s3-restore --bucket_paths "{{ .bucket_paths }}" --ttl "{{ .ttl }}"
+      exec ./s3-restore --bucket_paths "{{ .bucket_paths }}" --restore_action "{{ .restore_action }}"
     args:
       - name: bucket_paths
         description: The list of S3 bucket paths to restore, as a comma-separated string.
         required: true
-      - name: ttl
-        description: |
-          Time-to-live (TTL) in days for restored objects before reverting to their original storage class. 
-          - If a number of days is provided (e.g., 7), the objects will be restored temporarily for that duration.
-          - If "standard" is passed, the objects will be permanently restored and moved to the STANDARD storage class.
+      - name: restore_action
+        description: The action to take. Pass a number of days to restore temporarily, or "standard" to restore and move objects to STANDARD storage class.
         required: true
     env:
       - AWS_DEFAULT_REGION
