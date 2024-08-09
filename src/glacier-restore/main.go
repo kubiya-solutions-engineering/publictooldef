@@ -272,29 +272,40 @@ func restoreObject(svc *s3.S3, bucketName, key string, restoreAction string, sem
 
 	log.Printf("Attempting to restore object: %s/%s", bucketName, key)
 
-	restoreRequest := &s3.RestoreObjectInput{
-		Bucket: aws.String(bucketName),
-		Key:    aws.String(key),
-		RestoreRequest: &s3.RestoreRequest{
-			Days: aws.Int64(7),
-			GlacierJobParameters: &s3.GlacierJobParameters{
-				Tier: aws.String("Standard"),
-			},
-		},
-	}
-
+	var restoreRequest *s3.RestoreRequest
 	if restoreAction != "standard" {
 		days, err := strconv.ParseInt(restoreAction, 10, 64)
 		if err == nil {
-			restoreRequest.RestoreRequest.Days = aws.Int64(days)
+			restoreRequest = &s3.RestoreRequest{
+				Days: aws.Int64(days),
+				GlacierJobParameters: &s3.GlacierJobParameters{
+					Tier: aws.String("Standard"), // Use "Standard" retrieval tier
+				},
+			}
 		} else {
 			log.Printf("Invalid restore action passed: %s. Defaulting to 7 days.", restoreAction)
+			restoreRequest = &s3.RestoreRequest{
+				Days: aws.Int64(7),
+				GlacierJobParameters: &s3.GlacierJobParameters{
+					Tier: aws.String("Standard"),
+				},
+			}
 		}
 	} else {
-		restoreRequest.RestoreRequest.Days = nil
+		restoreRequest = &s3.RestoreRequest{
+			GlacierJobParameters: &s3.GlacierJobParameters{
+				Tier: aws.String("Standard"),
+			},
+		}
 	}
 
-	_, err := svc.RestoreObject(restoreRequest)
+	restoreObjectInput := &s3.RestoreObjectInput{
+		Bucket:         aws.String(bucketName),
+		Key:            aws.String(key),
+		RestoreRequest: restoreRequest,
+	}
+
+	_, err := svc.RestoreObject(restoreObjectInput)
 	if err != nil {
 		log.Printf("Failed to restore object %s: %v", key, err)
 		return
@@ -302,6 +313,7 @@ func restoreObject(svc *s3.S3, bucketName, key string, restoreAction string, sem
 
 	log.Printf("Object %s has been successfully restored.", key)
 
+	// If "standard" is specified, wait for restoration to complete, then move to STANDARD storage class
 	if restoreAction == "standard" {
 		err := waitForRestoreCompletion(svc, bucketName, key)
 		if err != nil {
@@ -309,14 +321,12 @@ func restoreObject(svc *s3.S3, bucketName, key string, restoreAction string, sem
 			return
 		}
 
-		copyInput := &s3.CopyObjectInput{
+		_, err = svc.CopyObject(&s3.CopyObjectInput{
 			Bucket:       aws.String(bucketName),
 			CopySource:   aws.String(fmt.Sprintf("%s/%s", bucketName, key)),
 			Key:          aws.String(key),
 			StorageClass: aws.String("STANDARD"),
-		}
-
-		_, err = svc.CopyObject(copyInput)
+		})
 		if err != nil {
 			log.Printf("Failed to move object %s to STANDARD storage class: %v", key, err)
 		} else {
