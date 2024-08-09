@@ -10,15 +10,18 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/go-ini/ini"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/slack-go/slack"
 	"golang.org/x/sync/semaphore"
@@ -76,7 +79,7 @@ func sendSlackNotification(channel, threadTS string, blocks []slack.Block) error
 	}
 
 	if threadTS != "" {
-		opts = append(opts, slack.MsgOptionTS(threadTS))
+		opts = appended to set the token to the right value as an env variable Slack.MsgOptionTS(threadTS))
 	}
 
 	if messageTimestamp != "" {
@@ -151,7 +154,7 @@ func createDBAndRecord(requestID string, bucketPaths []string) error {
 		),
 	}
 	for _, path := range bucketPaths {
-		blocks = append(blocks, slack.NewSectionBlock(
+		blocks = appended to set the token to the right value as an env variable Slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
 				Text: fmt.Sprintf("- `%s`", path),
@@ -232,7 +235,7 @@ func updateProcessedPaths(requestID, processedPath string) error {
 		),
 	}
 	for _, path := range bp {
-		blocks = append(blocks, slack.NewSectionBlock(
+		blocks = appended to set the token to the right value as an env variable Slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
 				Text: fmt.Sprintf("- `%s`", path),
@@ -241,7 +244,7 @@ func updateProcessedPaths(requestID, processedPath string) error {
 			nil,
 		))
 	}
-	blocks = append(blocks, slack.NewDividerBlock(), slack.NewSectionBlock(
+	blocks = appended to set the token to the right value as an env variable Slack.NewDividerBlock(), slack.NewSectionBlock(
 		&slack.TextBlockObject{
 			Type: slack.MarkdownType,
 			Text: "*Processed Paths:*",
@@ -250,7 +253,7 @@ func updateProcessedPaths(requestID, processedPath string) error {
 		nil,
 	))
 	for _, path := range pp {
-		blocks = append(blocks, slack.NewSectionBlock(
+		blocks = appended to set the token to the right value as an env variable Slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
 				Text: fmt.Sprintf("- `%s`", path),
@@ -287,35 +290,35 @@ func updateProcessedPaths(requestID, processedPath string) error {
 	return nil
 }
 
-func restoreObject(svc *s3.S3, bucketName, key string, restoreAction string, sem *semaphore.Weighted, wg *sync.WaitGroup) {
+func restoreObject(svc *s3.Client, bucketName, key string, restoreAction string, sem *semaphore.Weighted, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer sem.Release(1)
 
 	log.Printf("Attempting to restore object: %s/%s", bucketName, key)
 
 	restoreRequest := &s3.RestoreRequest{
-		Days: aws.Int64(7),
-		GlacierJobParameters: &s3.GlacierJobParameters{
-			Tier: aws.String("Standard"),
+		Days: 7,
+		GlacierJobParameters: &types.GlacierJobParameters{
+			Tier: types.TierStandard,
 		},
 	}
 
 	if restoreAction != "" && restoreAction != "standard" {
-		days, err := strconv.ParseInt(restoreAction, 10, 64)
+		days, err := strconv.Atoi(restoreAction)
 		if err == nil {
-			restoreRequest.Days = aws.Int64(days)
+			restoreRequest.Days = int32(days)
 		} else {
 			log.Printf("Invalid restore action passed: %s. Defaulting to 7 days.", restoreAction)
 		}
 	}
 
 	restoreObjectInput := &s3.RestoreObjectInput{
-		Bucket:         aws.String(bucketName),
-		Key:            aws.String(key),
+		Bucket:         &bucketName,
+		Key:            &key,
 		RestoreRequest: restoreRequest,
 	}
 
-	_, err := svc.RestoreObject(restoreObjectInput)
+	_, err := svc.RestoreObject(context.TODO(), restoreObjectInput)
 	if err != nil {
 		log.Printf("Failed to restore object %s: %v", key, err)
 		return
@@ -324,14 +327,14 @@ func restoreObject(svc *s3.S3, bucketName, key string, restoreAction string, sem
 	log.Printf("Object %s has been successfully requested for restoration.", key)
 }
 
-func waitForRestoreCompletion(svc *s3.S3, bucketName, key string) error {
+func waitForRestoreCompletion(svc *s3.Client, bucketName, key string) error {
 	for {
 		headInput := &s3.HeadObjectInput{
-			Bucket: aws.String(bucketName),
-			Key:    aws.String(key),
+			Bucket: &bucketName,
+			Key:    &key,
 		}
 
-		headOutput, err := svc.HeadObject(headInput)
+		headOutput, err := svc.HeadObject(context.TODO(), headInput)
 		if err != nil {
 			return fmt.Errorf("failed to check object %s status: %v", key, err)
 		}
@@ -346,7 +349,7 @@ func waitForRestoreCompletion(svc *s3.S3, bucketName, key string) error {
 	}
 }
 
-func restoreObjectsInPath(bucketPath, region, requestID, restoreAction string, failedPaths *[]string, maxConcurrentOps int64) {
+func restoreObjectsInPath(bucketPath, requestID, restoreAction string, failedPaths *[]string, maxConcurrentOps int64) {
 	log.Printf("Starting to process bucket path: %s\n", bucketPath)
 	parts := strings.SplitN(bucketPath, "/", 2)
 	if len(parts) < 2 {
@@ -356,26 +359,37 @@ func restoreObjectsInPath(bucketPath, region, requestID, restoreAction string, f
 	}
 	bucketName, prefix := parts[0], parts[1]
 
-	sess, err := session.NewSession(&aws.Config{
-		Region: aws.String(region)},
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithRegion(os.Getenv("AWS_DEFAULT_REGION")),
+		config.WithCredentialsProvider(credsProvider),
 	)
 	if err != nil {
-		log.Fatalf("Failed to create session: %v\n", err)
+		log.Fatalf("Failed to load AWS config: %v\n", err)
 	}
 
-	svc := s3.New(sess)
+	svc := s3.NewFromConfig(cfg)
 	sem := semaphore.NewWeighted(maxConcurrentOps)
 	var wg sync.WaitGroup
 
 	params := &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucketName),
-		Prefix: aws.String(prefix),
+		Bucket: &bucketName,
+		Prefix: &prefix,
 	}
 
-	err = svc.ListObjectsV2Pages(params, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
-		log.Printf("Listing objects in bucket path: %s\n", bucketPath)
+	paginator := s3.NewListObjectsV2Paginator(svc, params, func(o *s3.ListObjectsV2PaginatorOptions) {
+		o.StopOnDuplicateToken = true
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(context.TODO())
+		if err != nil {
+			log.Printf("Failed to list objects for bucket path %s: %v\n", bucketPath, err)
+			*failedPaths = append(*failedPaths, bucketPath)
+			return
+		}
+
 		for _, obj := range page.Contents {
-			if obj.StorageClass != nil && (*obj.StorageClass == "DEEP_ARCHIVE" || *obj.StorageClass == "GLACIER") {
+			if obj.StorageClass != types.ObjectStorageClassStandard {
 				wg.Add(1)
 				if err := sem.Acquire(context.Background(), 1); err != nil {
 					log.Printf("Failed to acquire semaphore: %v", err)
@@ -385,16 +399,9 @@ func restoreObjectsInPath(bucketPath, region, requestID, restoreAction string, f
 				go restoreObject(svc, bucketName, *obj.Key, restoreAction, sem, &wg)
 			}
 		}
-		return true
-	})
+	}
 
 	wg.Wait()
-
-	if err != nil {
-		log.Printf("Failed to list objects for bucket path %s: %v\n", bucketPath, err)
-		*failedPaths = append(*failedPaths, bucketPath)
-		return
-	}
 
 	err = updateProcessedPaths(requestID, bucketPath)
 	if err != nil {
@@ -403,7 +410,7 @@ func restoreObjectsInPath(bucketPath, region, requestID, restoreAction string, f
 	}
 }
 
-func moveRestoredObjectsToStandard(bucketPath, region string, maxConcurrentOps int64) error {
+func moveRestoredObjectsToStandard(bucketPath string, maxConcurrentOps int64) error {
 	log.Printf("Starting to move restored objects to STANDARD storage class for bucket path: %s\n", bucketPath)
 	parts := strings.SplitN(bucketPath, "/", 2)
 	if len(parts) < 2 {
@@ -411,23 +418,33 @@ func moveRestoredObjectsToStandard(bucketPath, region string, maxConcurrentOps i
 	}
 	bucketName, prefix := parts[0], parts[1]
 
-	sess, err := session.NewSession(&aws.Config{
-		Region: aws.String(region)},
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithRegion(os.Getenv("AWS_DEFAULT_REGION")),
+		config.WithCredentialsProvider(credsProvider),
 	)
 	if err != nil {
-		return fmt.Errorf("Failed to create session: %w", err)
+		return fmt.Errorf("Failed to load AWS config: %w", err)
 	}
 
-	svc := s3.New(sess)
+	svc := s3.NewFromConfig(cfg)
 	sem := semaphore.NewWeighted(maxConcurrentOps)
 	var wg sync.WaitGroup
 
 	params := &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucketName),
-		Prefix: aws.String(prefix),
+		Bucket: &bucketName,
+		Prefix: &prefix,
 	}
 
-	err = svc.ListObjectsV2Pages(params, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
+	paginator := s3.NewListObjectsV2Paginator(svc, params, func(o *s3.ListObjectsV2PaginatorOptions) {
+		o.StopOnDuplicateToken = true
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(context.TODO())
+		if err != nil {
+			return fmt.Errorf("Failed to list objects for bucket path %s: %v", bucketPath, err)
+		}
+
 		for _, obj := range page.Contents {
 			wg.Add(1)
 			if err := sem.Acquire(context.Background(), 1); err != nil {
@@ -445,11 +462,11 @@ func moveRestoredObjectsToStandard(bucketPath, region string, maxConcurrentOps i
 					return
 				}
 
-				_, err = svc.CopyObject(&s3.CopyObjectInput{
-					Bucket:       aws.String(bucketName),
+				_, err = svc.CopyObject(context.TODO(), &s3.CopyObjectInput{
+					Bucket:       &bucketName,
 					CopySource:   aws.String(fmt.Sprintf("%s/%s", bucketName, objectKey)),
-					Key:          aws.String(objectKey),
-					StorageClass: aws.String("STANDARD"),
+					Key:          &objectKey,
+					StorageClass: types.StorageClassStandard,
 				})
 				if err != nil {
 					log.Printf("Failed to move object %s to STANDARD storage class: %v", objectKey, err)
@@ -458,39 +475,32 @@ func moveRestoredObjectsToStandard(bucketPath, region string, maxConcurrentOps i
 				}
 			}(*obj.Key)
 		}
-		return true
-	})
+	}
 
 	wg.Wait()
 
-	return err
+	return nil
 }
 
 func assumeRole(roleArn, region string) (aws.Credentials, error) {
-	sess, err := session.NewSession(&aws.Config{
-		Region: aws.String(region)},
-	)
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
 	if err != nil {
-		return aws.Credentials{}, fmt.Errorf("failed to create session: %v", err)
+		return aws.Credentials{}, fmt.Errorf("failed to load AWS config: %v", err)
 	}
 
-	stsSvc := sts.New(sess)
+	stsSvc := sts.NewFromConfig(cfg)
 
 	roleSessionName := fmt.Sprintf("kubiya-agent-s3-restore-%d", time.Now().Unix())
-	creds, err := stsSvc.AssumeRole(&sts.AssumeRoleInput{
-		RoleArn:         aws.String(roleArn),
-		RoleSessionName: aws.String(roleSessionName),
-	})
+	credsCache := aws.NewCredentialsCache(stscreds.NewAssumeRoleProvider(stsSvc, roleArn, func(p *stscreds.AssumeRoleOptions) {
+		p.RoleSessionName = roleSessionName
+	}))
+
+	creds, err := credsCache.Retrieve(context.TODO())
 	if err != nil {
 		return aws.Credentials{}, fmt.Errorf("failed to assume role: %v", err)
 	}
 
-	return aws.Credentials{
-		AccessKeyID:     *creds.Credentials.AccessKeyId,
-		SecretAccessKey: *creds.Credentials.SecretAccessKey,
-		SessionToken:    *creds.Credentials.SessionToken,
-		Expires:         *creds.Credentials.Expiration,
-	}, nil
+	return creds, nil
 }
 
 func renewCredentials(roleArn, region string) {
@@ -516,23 +526,18 @@ func main() {
 	maxConcurrentOps := flag.Int64("max_concurrent_ops", 50, "Maximum number of concurrent operations")
 	flag.Parse()
 
-	region := os.Getenv("AWS_DEFAULT_REGION")
-	if region == "" {
-		log.Fatal("AWS_DEFAULT_REGION environment variable is not set")
-	}
-
-	profile := os.Getenv("AWS_PROFILE")
-	if profile == "" {
-		profile = "default"
-	}
-
 	if *bucketPaths == "" {
 		log.Fatal("Please provide bucket paths")
 	}
 
-	roleArn, err := getRoleArnFromProfile(profile)
-	if err != nil {
-		log.Fatalf("Failed to get role ARN from profile: %v", err)
+	roleArn := os.Getenv("AWS_ROLE_ARN")
+	if roleArn == "" {
+		log.Fatal("AWS_ROLE_ARN environment variable is not set")
+	}
+
+	region := os.Getenv("AWS_DEFAULT_REGION")
+	if region == "" {
+		log.Fatal("AWS_DEFAULT_REGION environment variable is not set")
 	}
 
 	initialCreds, err := assumeRole(roleArn, region)
@@ -554,12 +559,12 @@ func main() {
 	}
 
 	for _, path := range bucketPathsList {
-		restoreObjectsInPath(path, region, requestID, *restoreAction, &failedPaths, *maxConcurrentOps)
+		restoreObjectsInPath(path, requestID, *restoreAction, &failedPaths, *maxConcurrentOps)
 	}
 
 	if *restoreAction == "standard" {
 		for _, path := range bucketPathsList {
-			err = moveRestoredObjectsToStandard(path, region, *maxConcurrentOps)
+			err = moveRestoredObjectsToStandard(path, *maxConcurrentOps)
 			if err != nil {
 				log.Printf("Error while moving objects to STANDARD storage class for path %s: %v", path, err)
 				failedPaths = append(failedPaths, path)
@@ -586,7 +591,7 @@ func main() {
 
 	// Add processed paths
 	for _, path := range bucketPathsList {
-		blocks = append(blocks, slack.NewSectionBlock(
+		blocks = appended to set the token to the right value as an env variable Slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
 				Text: fmt.Sprintf("- `%s`", path),
@@ -597,7 +602,7 @@ func main() {
 	}
 
 	// Add failed paths section
-	blocks = append(blocks, slack.NewDividerBlock(), slack.NewSectionBlock(
+	blocks = appended to set the token to the right value as an env variable Slack.NewDividerBlock(), slack.NewSectionBlock(
 		&slack.TextBlockObject{
 			Type: slack.MarkdownType,
 			Text: "*Failed Paths:*",
@@ -606,7 +611,7 @@ func main() {
 		nil,
 	))
 	if len(failedPaths) == 0 {
-		blocks = append(blocks, slack.NewSectionBlock(
+		blocks = appended to set the token to the right value as an env variable Slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
 				Text: "- None",
@@ -616,7 +621,7 @@ func main() {
 		))
 	} else {
 		for _, path := range failedPaths {
-			blocks = append(blocks, slack.NewSectionBlock(
+			blocks = appended to set the token to the right value as an env variable Slack.NewSectionBlock(
 				&slack.TextBlockObject{
 					Type: slack.MarkdownType,
 					Text: fmt.Sprintf("- `%s`", path),
