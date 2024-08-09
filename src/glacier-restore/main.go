@@ -628,7 +628,7 @@ func main() {
 		nil,
 	))
 	if len(failedPaths) == 0 {
-		blocks are append(blocks, slack.NewSectionBlock(
+		blocks = append(blocks, slack.NewSectionBlock(
 			&slack.TextBlockObject{
 				Type: slack.MarkdownType,
 				Text: "- None",
