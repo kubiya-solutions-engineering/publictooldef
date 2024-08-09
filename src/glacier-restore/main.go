@@ -487,7 +487,7 @@ func renewCredentials(roleArn, region string) {
 func main() {
 	bucketPaths := flag.String("bucket_paths", "", "Comma-separated list of S3 bucket paths to restore")
 	restoreAction := flag.String("restore_action", "", "Specify the restore action. Pass a number of days to restore temporarily, or 'standard' to restore and move objects to STANDARD storage class.")
-	maxConcurrentOps := flag.Int64("max_concurrent_ops", 5, "Maximum number of concurrent operations")
+	maxConcurrentOps := flag.Int64("max_concurrent_ops", 10, "Maximum number of concurrent operations")
 	flag.Parse()
 
 	region := os.Getenv("AWS_DEFAULT_REGION")
