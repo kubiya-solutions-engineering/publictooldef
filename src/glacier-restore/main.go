@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/go-ini/ini"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/slack-go/slack"
 	"golang.org/x/sync/semaphore"
@@ -51,8 +52,10 @@ func (p *customCredentialsProvider) UpdateCredentials(newCreds aws.Credentials) 
 	p.creds = newCreds
 }
 
-var messageTimestamp string
-var credsProvider *customCredentialsProvider
+var (
+	messageTimestamp string
+	credsProvider    *customCredentialsProvider
+)
 
 func generateRequestID() string {
 	bytes := make([]byte, 16)
@@ -293,7 +296,7 @@ func restoreObject(svc *s3.Client, bucketName, key string, restoreAction string,
 
 	log.Printf("Attempting to restore object: %s/%s", bucketName, key)
 
-	restoreRequest := &types.RestoreRequest{
+	restoreRequest := &s3.RestoreRequest{
 		Days: aws.Int32(7),
 		GlacierJobParameters: &types.GlacierJobParameters{
 			Tier: types.TierStandard,
@@ -361,7 +364,7 @@ func restoreObjectsInPath(bucketPath, requestID, restoreAction string, failedPat
 		config.WithCredentialsProvider(credsProvider),
 	)
 	if err != nil {
-		log.Fatalf("Failed to create session: %v\n", err)
+		log.Fatalf("Failed to load AWS config: %v\n", err)
 	}
 
 	svc := s3.NewFromConfig(cfg)
@@ -418,7 +421,7 @@ func moveRestoredObjectsToStandard(bucketPath string, maxConcurrentOps int64) er
 		config.WithCredentialsProvider(credsProvider),
 	)
 	if err != nil {
-		return fmt.Errorf("Failed to create session: %w", err)
+		return fmt.Errorf("Failed to load AWS config: %w", err)
 	}
 
 	svc := s3.NewFromConfig(cfg)
@@ -435,7 +438,8 @@ func moveRestoredObjectsToStandard(bucketPath string, maxConcurrentOps int64) er
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(context.TODO())
 		if err != nil {
-			return fmt.Errorf("Failed to list objects for bucket path %s: %v", bucketPath, err)
+			log.Printf("Failed to list objects for bucket path %s: %v", bucketPath, err)
+			return err
 		}
 
 		for _, obj := range page.Contents {
@@ -472,7 +476,27 @@ func moveRestoredObjectsToStandard(bucketPath string, maxConcurrentOps int64) er
 
 	wg.Wait()
 
-	return nil
+	return err
+}
+
+func getRoleArnFromProfile(profile string) (string, error) {
+	credsFile := filepath.Join(os.Getenv("HOME"), ".aws", "credentials")
+	cfg, err := ini.Load(credsFile)
+	if err != nil {
+		return "", fmt.Errorf("failed to load AWS credentials file: %v", err)
+	}
+
+	section, err := cfg.GetSection(profile)
+	if err != nil {
+		return "", fmt.Errorf("failed to get profile %s: %v", profile, err)
+	}
+
+	roleArn, err := section.GetKey("role_arn")
+	if err != nil {
+		return "", fmt.Errorf("failed to get role_arn from profile %s: %v", profile, err)
+	}
+
+	return roleArn.String(), nil
 }
 
 func assumeRole(roleArn, region string) (aws.Credentials, error) {
@@ -524,9 +548,14 @@ func main() {
 		log.Fatal("AWS_DEFAULT_REGION environment variable is not set")
 	}
 
-	roleArn := os.Getenv("AWS_ROLE_ARN")
-	if roleArn == "" {
-		log.Fatal("AWS_ROLE_ARN environment variable is not set")
+	profile := os.Getenv("AWS_PROFILE")
+	if profile == "" {
+		log.Fatal("AWS_PROFILE environment variable is not set")
+	}
+
+	roleArn, err := getRoleArnFromProfile(profile)
+	if err != nil {
+		log.Fatalf("Failed to get role ARN from profile: %v", err)
 	}
 
 	initialCreds, err := assumeRole(roleArn, region)
