@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/slack-go/slack"
@@ -31,6 +32,11 @@ type RestoreRequest struct {
 	CreatedAt      string   `json:"created_at"`
 	UpdatedAt      string   `json:"updated_at"`
 }
+
+var (
+	messageTimestamp string
+	credsProvider    *customCredentialsProvider
+)
 
 type customCredentialsProvider struct {
 	creds *aws.Credentials
@@ -48,11 +54,6 @@ func (p *customCredentialsProvider) UpdateCredentials(newCreds aws.Credentials) 
 	defer p.mu.Unlock()
 	*p.creds = newCreds
 }
-
-var (
-	messageTimestamp string
-	credsProvider    *customCredentialsProvider
-)
 
 func generateRequestID() string {
 	bytes := make([]byte, 16)
@@ -287,33 +288,35 @@ func updateProcessedPaths(requestID, processedPath string) error {
 	return nil
 }
 
-func restoreObject(svc *s3.Client, bucketName, key string, restoreAction string, wg *sync.WaitGroup, sem *semaphore.Weighted) {
+func restoreObject(svc *s3.Client, bucketName, key string, restoreAction string, sem *semaphore.Weighted, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer sem.Release(1)
 
 	log.Printf("Attempting to restore object: %s/%s", bucketName, key)
 
-	restoreRequest := &s3.RestoreObjectInput{
-		Bucket: aws.String(bucketName),
-		Key:    aws.String(key),
-		RestoreRequest: &s3types.RestoreRequest{
-			Days: 7,
-			GlacierJobParameters: &s3types.GlacierJobParameters{
-				Tier: s3types.TierStandard,
-			},
+	restoreRequest := &s3types.RestoreRequest{
+		Days: aws.Int32(7),
+		GlacierJobParameters: &s3types.GlacierJobParameters{
+			Tier: s3types.TierStandard,
 		},
 	}
 
 	if restoreAction != "" && restoreAction != "standard" {
-		days, err := strconv.ParseInt(restoreAction, 10, 64)
+		days, err := strconv.ParseInt(restoreAction, 10, 32)
 		if err == nil {
-			restoreRequest.RestoreRequest.Days = int32(days)
+			restoreRequest.Days = aws.Int32(int32(days))
 		} else {
 			log.Printf("Invalid restore action passed: %s. Defaulting to 7 days.", restoreAction)
 		}
 	}
 
-	_, err := svc.RestoreObject(context.TODO(), restoreRequest)
+	restoreObjectInput := &s3.RestoreObjectInput{
+		Bucket:         aws.String(bucketName),
+		Key:            aws.String(key),
+		RestoreRequest: restoreRequest,
+	}
+
+	_, err := svc.RestoreObject(context.TODO(), restoreObjectInput)
 	if err != nil {
 		log.Printf("Failed to restore object %s: %v", key, err)
 		return
@@ -354,7 +357,10 @@ func restoreObjectsInPath(bucketPath, requestID, restoreAction string, failedPat
 	}
 	bucketName, prefix := parts[0], parts[1]
 
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithRegion(region),
+		config.WithCredentialsProvider(credsProvider),
+	)
 	if err != nil {
 		log.Fatalf("Failed to load AWS config: %v\n", err)
 	}
@@ -379,14 +385,14 @@ func restoreObjectsInPath(bucketPath, requestID, restoreAction string, failedPat
 		}
 
 		for _, obj := range page.Contents {
-			if obj.StorageClass != s3types.StorageClassStandard {
+			if obj.StorageClass != s3types.ObjectStorageClassStandard {
 				wg.Add(1)
 				if err := sem.Acquire(context.Background(), 1); err != nil {
 					log.Printf("Failed to acquire semaphore: %v", err)
 					wg.Done()
 					continue
 				}
-				go restoreObject(svc, bucketName, *obj.Key, restoreAction, &wg, sem)
+				go restoreObject(svc, bucketName, *obj.Key, restoreAction, sem, &wg)
 			}
 		}
 	}
@@ -408,9 +414,12 @@ func moveRestoredObjectsToStandard(bucketPath, region string, maxConcurrentOps i
 	}
 	bucketName, prefix := parts[0], parts[1]
 
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithRegion(region),
+		config.WithCredentialsProvider(credsProvider),
+	)
 	if err != nil {
-		return fmt.Errorf("Failed to create AWS config: %w", err)
+		return fmt.Errorf("Failed to load AWS config: %w", err)
 	}
 
 	svc := s3.NewFromConfig(cfg)
@@ -427,8 +436,7 @@ func moveRestoredObjectsToStandard(bucketPath, region string, maxConcurrentOps i
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(context.TODO())
 		if err != nil {
-			log.Printf("Failed to list objects for bucket path %s: %v\n", bucketPath, err)
-			return err
+			return fmt.Errorf("Failed to list objects for bucket path %s: %v", bucketPath, err)
 		}
 
 		for _, obj := range page.Contents {
@@ -468,31 +476,40 @@ func moveRestoredObjectsToStandard(bucketPath, region string, maxConcurrentOps i
 	return err
 }
 
-func getRoleArnFromSTS(ctx context.Context, cfg aws.Config) (string, error) {
-	stsClient := sts.NewFromConfig(cfg)
-
-	identityOutput, err := stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+func assumeRole(region string) (aws.Credentials, error) {
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
 	if err != nil {
-		return "", fmt.Errorf("failed to get caller identity: %v", err)
+		return aws.Credentials{}, fmt.Errorf("failed to load AWS config: %v", err)
 	}
 
-	arnParts := strings.Split(*identityOutput.Arn, "/")
-	if len(arnParts) < 2 {
-		return "", fmt.Errorf("unexpected ARN format: %v", *identityOutput.Arn)
+	stsSvc := sts.NewFromConfig(cfg)
+
+	callerIdentity, err := stsSvc.GetCallerIdentity(context.TODO(), &sts.GetCallerIdentityInput{})
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("failed to get caller identity: %v", err)
 	}
 
-	// Assuming the ARN is in the format: arn:aws:iam::account-id:role/role-name
-	// or arn:aws:sts::account-id:assumed-role/role-name/session-name
-	roleArn := arnParts[0] + "/" + arnParts[1]
-	return roleArn, nil
+	arn := *callerIdentity.Arn
+
+	roleSessionName := fmt.Sprintf("kubiya-agent-s3-restore-%d", time.Now().Unix())
+	credsCache := aws.NewCredentialsCache(stscreds.NewAssumeRoleProvider(stsSvc, arn, func(p *stscreds.AssumeRoleOptions) {
+		p.RoleSessionName = roleSessionName
+	}))
+
+	creds, err := credsCache.Retrieve(context.TODO())
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("failed to assume role: %v", err)
+	}
+
+	return creds, nil
 }
 
-func renewCredentials(roleArn, region string) {
+func renewCredentials(region string) {
 	ticker := time.NewTicker(30 * time.Minute)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		newCreds, err := assumeRole(roleArn, region)
+		newCreds, err := assumeRole(region)
 		if err != nil {
 			log.Printf("Failed to renew credentials: %v", err)
 			continue
@@ -519,24 +536,14 @@ func main() {
 		log.Fatal("Please provide bucket paths")
 	}
 
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
-	if err != nil {
-		log.Fatalf("Failed to load AWS config: %v", err)
-	}
-
-	roleArn, err := getRoleArnFromSTS(context.TODO(), cfg)
-	if err != nil {
-		log.Fatalf("Failed to get role ARN: %v", err)
-	}
-
-	initialCreds, err := assumeRole(roleArn, region)
+	initialCreds, err := assumeRole(region)
 	if err != nil {
 		log.Fatalf("Failed to assume role: %v", err)
 	}
 
 	credsProvider = &customCredentialsProvider{creds: &initialCreds}
 
-	go renewCredentials(roleArn, region)
+	go renewCredentials(region)
 
 	requestID := generateRequestID()
 	bucketPathsList := strings.Split(*bucketPaths, ",")
