@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,7 +20,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/go-ini/ini"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/slack-go/slack"
 	"golang.org/x/sync/semaphore"
@@ -32,6 +35,11 @@ type RestoreRequest struct {
 	CreatedAt      string   `json:"created_at"`
 	UpdatedAt      string   `json:"updated_at"`
 }
+
+var (
+	messageTimestamp string
+	credsProvider    *customCredentialsProvider
+)
 
 type customCredentialsProvider struct {
 	creds *aws.Credentials
@@ -49,11 +57,6 @@ func (p *customCredentialsProvider) UpdateCredentials(newCreds aws.Credentials) 
 	defer p.mu.Unlock()
 	*p.creds = newCreds
 }
-
-var (
-	messageTimestamp string
-	credsProvider    *customCredentialsProvider
-)
 
 func generateRequestID() string {
 	bytes := make([]byte, 16)
@@ -121,7 +124,7 @@ func createDBAndRecord(requestID string, bucketPaths []string) error {
 	processedPathsJSON, _ := json.Marshal([]string{})
 	insertQuery := `
 	INSERT INTO restore_requests (request_id, bucket_paths, processed_paths, created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?)`
+	VALUES (?, ?, ?, ?, ?, ?)`
 	_, err = db.Exec(insertQuery, requestID, bucketPathsJSON, processedPathsJSON, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
 		return fmt.Errorf("failed to insert record: %w", err)
@@ -294,29 +297,29 @@ func restoreObject(svc *s3.Client, bucketName, key string, restoreAction string,
 
 	log.Printf("Attempting to restore object: %s/%s", bucketName, key)
 
-	restoreRequest := &s3.RestoreObjectInput{
-		Bucket: aws.String(bucketName),
-		Key:    aws.String(key),
-		RestoreRequest: &s3.RestoreRequest{
-			Days: aws.Int64(7),
-			GlacierJobParameters: &s3.GlacierJobParameters{
-				Tier: aws.String("Standard"),
-			},
+	restoreRequest := &types.RestoreRequest{
+		Days: aws.Int32(7),
+		GlacierJobParameters: &types.GlacierJobParameters{
+			Tier: types.TierStandard,
 		},
 	}
 
 	if restoreAction != "standard" {
 		days, err := strconv.ParseInt(restoreAction, 10, 64)
 		if err == nil {
-			restoreRequest.RestoreRequest.Days = aws.Int64(days)
+			restoreRequest.Days = aws.Int32(int32(days))
 		} else {
 			log.Printf("Invalid restore action passed: %s. Defaulting to 7 days.", restoreAction)
 		}
 	} else {
-		restoreRequest.RestoreRequest.Days = nil
+		restoreRequest.Days = nil
 	}
 
-	_, err := svc.RestoreObject(context.TODO(), restoreRequest)
+	_, err := svc.RestoreObject(context.TODO(), &s3.RestoreObjectInput{
+		Bucket:          aws.String(bucketName),
+		Key:             aws.String(key),
+		RestoreRequest:  restoreRequest,
+	})
 	if err != nil {
 		log.Printf("Failed to restore object %s: %v", key, err)
 		return
@@ -331,14 +334,12 @@ func restoreObject(svc *s3.Client, bucketName, key string, restoreAction string,
 			return
 		}
 
-		copyInput := &s3.CopyObjectInput{
+		_, err = svc.CopyObject(context.TODO(), &s3.CopyObjectInput{
 			Bucket:       aws.String(bucketName),
 			CopySource:   aws.String(fmt.Sprintf("%s/%s", bucketName, key)),
 			Key:          aws.String(key),
-			StorageClass: aws.String("STANDARD"),
-		}
-
-		_, err = svc.CopyObject(context.TODO(), copyInput)
+			StorageClass: types.StorageClassStandard,
+		})
 		if err != nil {
 			log.Printf("Failed to move object %s to STANDARD storage class: %v", key, err)
 		} else {
@@ -349,12 +350,11 @@ func restoreObject(svc *s3.Client, bucketName, key string, restoreAction string,
 
 func waitForRestoreCompletion(svc *s3.Client, bucketName, key string) error {
 	for {
-		headInput := &s3.HeadObjectInput{
+		headOutput, err := svc.HeadObject(context.TODO(), &s3.HeadObjectInput{
 			Bucket: aws.String(bucketName),
 			Key:    aws.String(key),
-		}
+		})
 
-		headOutput, err := svc.HeadObject(context.TODO(), headInput)
 		if err != nil {
 			return fmt.Errorf("failed to check object %s status: %v", key, err)
 		}
@@ -396,10 +396,18 @@ func restoreObjectsInPath(bucketPath, region, requestID, restoreAction string, f
 		Prefix: aws.String(prefix),
 	}
 
-	err = svc.ListObjectsV2Pages(context.TODO(), params, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
-		log.Printf("Listing objects in bucket path: %s\n", bucketPath)
+	paginator := s3.NewListObjectsV2Paginator(svc, params)
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(context.TODO())
+		if err != nil {
+			log.Printf("Failed to list objects for bucket path %s: %v\n", bucketPath, err)
+			*failedPaths = append(*failedPaths, bucketPath)
+			return
+		}
+
 		for _, obj := range page.Contents {
-			if obj.StorageClass != nil && (*obj.StorageClass == "DEEP_ARCHIVE" || *obj.StorageClass == "GLACIER") {
+			if obj.StorageClass == types.ObjectStorageClassGlacier || obj.StorageClass == types.ObjectStorageClassDeepArchive {
 				wg.Add(1)
 				if err := sem.Acquire(context.Background(), 1); err != nil {
 					log.Printf("Failed to acquire semaphore: %v", err)
@@ -409,16 +417,9 @@ func restoreObjectsInPath(bucketPath, region, requestID, restoreAction string, f
 				go restoreObject(svc, bucketName, *obj.Key, restoreAction, sem, &wg)
 			}
 		}
-		return true
-	})
+	}
 
 	wg.Wait()
-
-	if err != nil {
-		log.Printf("Failed to list objects for bucket path %s: %v\n", bucketPath, err)
-		*failedPaths = append(*failedPaths, bucketPath)
-		return
-	}
 
 	err = updateProcessedPaths(requestID, bucketPath)
 	if err != nil {
@@ -488,9 +489,9 @@ func renewCredentials(roleArn, region string) {
 func main() {
 	bucketPaths := flag.String("bucket_paths", "", "Comma-separated list of S3 bucket paths to restore")
 	restoreAction := flag.String("restore_action", "", "Specify the restore action. Pass a number of days to restore temporarily, or 'standard' to restore and move objects to STANDARD storage class.")
-	region := flag.String("region", "", "AWS region")
-	profile := flag.String("profile", "default", "AWS profile to use")
 	maxConcurrentOps := flag.Int64("max_concurrent_ops", 50, "Maximum number of concurrent operations")
+	profile := flag.String("profile", "default", "AWS profile to use")
+	region := flag.String("region", "", "AWS region")
 	flag.Parse()
 
 	if *bucketPaths == "" {
@@ -498,9 +499,6 @@ func main() {
 	}
 	if *region == "" {
 		log.Fatal("Please provide an AWS region")
-	}
-	if *restoreAction == "" {
-		log.Fatal("Please provide the restore action")
 	}
 
 	roleArn, err := getRoleArnFromProfile(*profile)
