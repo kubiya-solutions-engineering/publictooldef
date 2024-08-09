@@ -36,11 +36,6 @@ type RestoreRequest struct {
 	UpdatedAt      string   `json:"updated_at"`
 }
 
-var (
-	messageTimestamp string
-	credsProvider    *customCredentialsProvider
-)
-
 type customCredentialsProvider struct {
 	creds *aws.Credentials
 	mu    sync.RWMutex
@@ -57,6 +52,11 @@ func (p *customCredentialsProvider) UpdateCredentials(newCreds aws.Credentials) 
 	defer p.mu.Unlock()
 	*p.creds = newCreds
 }
+
+var (
+	messageTimestamp string
+	credsProvider    *customCredentialsProvider
+)
 
 func generateRequestID() string {
 	bytes := make([]byte, 16)
@@ -298,7 +298,7 @@ func restoreObject(svc *s3.Client, bucketName, key string, restoreAction string,
 	log.Printf("Attempting to restore object: %s/%s", bucketName, key)
 
 	restoreRequest := &types.RestoreRequest{
-		Days: 7,
+		Days: aws.Int32(7), // Updated to use *int32
 		GlacierJobParameters: &types.GlacierJobParameters{
 			Tier: types.TierStandard,
 		},
@@ -307,7 +307,7 @@ func restoreObject(svc *s3.Client, bucketName, key string, restoreAction string,
 	if restoreAction != "" && restoreAction != "standard" {
 		days, err := strconv.ParseInt(restoreAction, 10, 32)
 		if err == nil {
-			restoreRequest.Days = int32(days)
+			restoreRequest.Days = aws.Int32(int32(days)) // Updated to assign *int32
 		} else {
 			log.Printf("Invalid restore action passed: %s. Defaulting to 7 days.", restoreAction)
 		}
@@ -360,10 +360,7 @@ func restoreObjectsInPath(bucketPath, requestID, restoreAction string, failedPat
 	}
 	bucketName, prefix := parts[0], parts[1]
 
-	cfg, err := config.LoadDefaultConfig(context.TODO(),
-		config.WithRegion(os.Getenv("AWS_DEFAULT_REGION")),
-		config.WithCredentialsProvider(credsProvider),
-	)
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithCredentialsProvider(credsProvider))
 	if err != nil {
 		log.Fatalf("Failed to load AWS config: %v\n", err)
 	}
@@ -377,9 +374,7 @@ func restoreObjectsInPath(bucketPath, requestID, restoreAction string, failedPat
 		Prefix: &prefix,
 	}
 
-	paginator := s3.NewListObjectsV2Paginator(svc, params, func(o *s3.ListObjectsV2PaginatorOptions) {
-		o.Limit = 1000
-	})
+	paginator := s3.NewListObjectsV2Paginator(svc, params)
 
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(context.TODO())
@@ -390,15 +385,16 @@ func restoreObjectsInPath(bucketPath, requestID, restoreAction string, failedPat
 		}
 
 		for _, obj := range page.Contents {
-			if obj.StorageClass != types.StorageClassStandard {
-				wg.Add(1)
-				if err := sem.Acquire(context.Background(), 1); err != nil {
-					log.Printf("Failed to acquire semaphore: %v", err)
-					wg.Done()
-					continue
-				}
-				go restoreObject(svc, bucketName, *obj.Key, restoreAction, sem, &wg)
+			if obj.StorageClass != types.ObjectStorageClassDeepArchive && obj.StorageClass != types.ObjectStorageClassGlacier {
+				continue
 			}
+			wg.Add(1)
+			if err := sem.Acquire(context.Background(), 1); err != nil {
+				log.Printf("Failed to acquire semaphore: %v", err)
+				wg.Done()
+				continue
+			}
+			go restoreObject(svc, bucketName, *obj.Key, restoreAction, sem, &wg)
 		}
 	}
 
@@ -419,10 +415,7 @@ func moveRestoredObjectsToStandard(bucketPath string, maxConcurrentOps int64) er
 	}
 	bucketName, prefix := parts[0], parts[1]
 
-	cfg, err := config.LoadDefaultConfig(context.TODO(),
-		config.WithRegion(os.Getenv("AWS_DEFAULT_REGION")),
-		config.WithCredentialsProvider(credsProvider),
-	)
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithCredentialsProvider(credsProvider))
 	if err != nil {
 		return fmt.Errorf("Failed to load AWS config: %w", err)
 	}
@@ -436,14 +429,12 @@ func moveRestoredObjectsToStandard(bucketPath string, maxConcurrentOps int64) er
 		Prefix: &prefix,
 	}
 
-	paginator := s3.NewListObjectsV2Paginator(svc, params, func(o *s3.ListObjectsV2PaginatorOptions) {
-		o.Limit = 1000
-	})
+	paginator := s3.NewListObjectsV2Paginator(svc, params)
 
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(context.TODO())
 		if err != nil {
-			return fmt.Errorf("Failed to list objects for bucket path %s: %v\n", bucketPath, err)
+			return fmt.Errorf("Failed to list objects for bucket path %s: %v", bucketPath, err)
 		}
 
 		for _, obj := range page.Contents {
@@ -480,7 +471,7 @@ func moveRestoredObjectsToStandard(bucketPath string, maxConcurrentOps int64) er
 
 	wg.Wait()
 
-	return err
+	return nil
 }
 
 func getRoleArnFromProfile(profile string) (string, error) {
@@ -545,26 +536,35 @@ func main() {
 	bucketPaths := flag.String("bucket_paths", "", "Comma-separated list of S3 bucket paths to restore")
 	restoreAction := flag.String("restore_action", "", "Specify the restore action. Pass a number of days to restore temporarily, or 'standard' to restore and move objects to STANDARD storage class.")
 	maxConcurrentOps := flag.Int64("max_concurrent_ops", 50, "Maximum number of concurrent operations")
-	profile := flag.String("profile", "default", "AWS profile to use")
 	flag.Parse()
 
-	if *bucketPaths == "" {
-		log.Fatal("Please provide bucket paths")
+	region := os.Getenv("AWS_DEFAULT_REGION")
+	if region == "" {
+		log.Fatal("AWS_DEFAULT_REGION environment variable is not set")
 	}
 
-	roleArn, err := getRoleArnFromProfile(*profile)
+	profile := os.Getenv("AWS_PROFILE")
+	if profile == "" {
+		profile = "default"
+	}
+
+	roleArn, err := getRoleArnFromProfile(profile)
 	if err != nil {
 		log.Fatalf("Failed to get role ARN from profile: %v", err)
 	}
 
-	initialCreds, err := assumeRole(roleArn, os.Getenv("AWS_DEFAULT_REGION"))
+	initialCreds, err := assumeRole(roleArn, region)
 	if err != nil {
 		log.Fatalf("Failed to assume role: %v", err)
 	}
 
 	credsProvider = &customCredentialsProvider{creds: &initialCreds}
 
-	go renewCredentials(roleArn, os.Getenv("AWS_DEFAULT_REGION"))
+	go renewCredentials(roleArn, region)
+
+	if *bucketPaths == "" {
+		log.Fatal("Please provide bucket paths")
+	}
 
 	requestID := generateRequestID()
 	bucketPathsList := strings.Split(*bucketPaths, ",")
@@ -619,6 +619,14 @@ func main() {
 	}
 
 	// Add failed paths section
+	blocks = append(blocks, slack.NewDividerBlock(), slack.NewSectionBlock(
+		&slack.TextBlockObject{
+			Type: slack.MarkdownType,
+			Text: "*Failed Paths:*",
+		},
+		nil,
+		nil,
+	))
 	if len(failedPaths) == 0 {
 		blocks = append(blocks, slack.NewSectionBlock(
 			&slack.TextBlockObject{
