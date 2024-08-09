@@ -272,30 +272,19 @@ func restoreObject(svc *s3.S3, bucketName, key string, restoreAction string, sem
 
 	log.Printf("Attempting to restore object: %s/%s", bucketName, key)
 
-	var restoreRequest *s3.RestoreRequest
-	if restoreAction != "standard" {
+	restoreRequest := &s3.RestoreRequest{
+		Days: aws.Int64(7),
+		GlacierJobParameters: &s3.GlacierJobParameters{
+			Tier: aws.String("Standard"),
+		},
+	}
+
+	if restoreAction != "" && restoreAction != "standard" {
 		days, err := strconv.ParseInt(restoreAction, 10, 64)
 		if err == nil {
-			restoreRequest = &s3.RestoreRequest{
-				Days: aws.Int64(days),
-				GlacierJobParameters: &s3.GlacierJobParameters{
-					Tier: aws.String("Standard"), // Use "Standard" retrieval tier
-				},
-			}
+			restoreRequest.Days = aws.Int64(days)
 		} else {
 			log.Printf("Invalid restore action passed: %s. Defaulting to 7 days.", restoreAction)
-			restoreRequest = &s3.RestoreRequest{
-				Days: aws.Int64(7),
-				GlacierJobParameters: &s3.GlacierJobParameters{
-					Tier: aws.String("Standard"),
-				},
-			}
-		}
-	} else {
-		restoreRequest = &s3.RestoreRequest{
-			GlacierJobParameters: &s3.GlacierJobParameters{
-				Tier: aws.String("Standard"),
-			},
 		}
 	}
 
@@ -311,7 +300,7 @@ func restoreObject(svc *s3.S3, bucketName, key string, restoreAction string, sem
 		return
 	}
 
-	log.Printf("Object %s has been successfully restored.", key)
+	log.Printf("Object %s has been successfully requested for restoration.", key)
 
 	// If "standard" is specified, wait for restoration to complete, then move to STANDARD storage class
 	if restoreAction == "standard" {
